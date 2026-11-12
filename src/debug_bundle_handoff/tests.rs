@@ -10,19 +10,12 @@ fn key(label: &str) -> String {
     blake3::hash(label.as_bytes()).to_hex().to_string()
 }
 
-/// Whether `dir`'s volume clones files, which [`capture`] requires. Linux
-/// tmpfs does not; APFS does.
-fn clones_files(dir: &Path) -> bool {
-    let source = dir.join(".probe-source");
-    let target = dir.join(".probe-target");
-    std::fs::write(&source, b"probe").unwrap();
-    let cloned = kache_fs::try_reflink(&source, &target).is_ok();
-    let _ = std::fs::remove_file(&source);
-    let _ = std::fs::remove_file(&target);
-    if !cloned {
-        eprintln!("skipping: {} cannot clone files", dir.display());
-    }
-    cloned
+/// What `capture` clones with in these tests: a plain copy, so they run on
+/// volumes without copy-on-write too. [`clone_file`] has its own tests.
+fn copy_clone(source: &Path, target: &Path) -> Result<()> {
+    std::fs::copy(source, target)
+        .with_context(|| format!("copying {}", source.display()))
+        .map(|_| ())
 }
 
 #[test]
@@ -47,20 +40,90 @@ fn only_unpacked_debug_info_on_macos_under_deferred_is_wanted() {
 }
 
 #[test]
-fn only_relative_objects_inside_the_root_are_captured() {
-    let root = Path::new("/target/debug");
+fn only_relative_objects_and_sysroot_rlibs_are_accepted() {
+    let sysroot = Some(Path::new("/toolchain"));
     assert_eq!(
-        object_to_capture("deps/a.o", root).unwrap(),
+        object_to_capture("deps/a.o", sysroot).unwrap(),
         Some(Path::new("deps/a.o"))
     );
     assert_eq!(
-        object_to_capture("/toolchain/lib/libstd.rlib", root).unwrap(),
+        object_to_capture("/toolchain/lib/rustlib/libstd.rlib", sysroot).unwrap(),
         None
     );
-    assert!(object_to_capture("/target/debug/deps/a.o", root).is_err());
-    for escaping in ["../other/a.o", "./a.o", "deps/../../a.o", ""] {
-        assert!(object_to_capture(escaping, root).is_err(), "{escaping:?}");
+    // A static archive a build script wrote, an object the prefix did not
+    // strip, and anything absolute when the sysroot is unknown.
+    for outside in ["/repo/native/build/libfoo.a", "/target/debug/deps/a.o"] {
+        let error = object_to_capture(outside, sysroot).unwrap_err();
+        assert!(format!("{error}").contains("sysroot"), "{error}");
     }
+    assert!(object_to_capture("/toolchain/lib/libstd.rlib", None).is_err());
+    assert!(object_to_capture("/toolchainx/libstd.rlib", sysroot).is_err());
+    for escaping in ["../other/a.o", "./a.o", "deps/../../a.o", ""] {
+        assert!(
+            object_to_capture(escaping, sysroot).is_err(),
+            "{escaping:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sysroot_is_also_matched_through_its_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().canonicalize().unwrap().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let rlib = real.join("lib/libstd.rlib");
+    assert!(in_sysroot(&rlib, &link));
+    assert!(in_sysroot(&link.join("lib/libstd.rlib"), &link));
+    assert!(!in_sysroot(Path::new("/elsewhere/libstd.rlib"), &link));
+}
+
+#[test]
+fn copy_on_write_is_the_only_clone() {
+    let dir = tempfile::tempdir().unwrap();
+    let error = clone_file(&dir.path().join("missing"), &dir.path().join("target")).unwrap_err();
+    assert!(format!("{error:#}").contains("copy-on-write"), "{error:#}");
+    assert!(!dir.path().join("target").exists());
+}
+
+#[test]
+fn the_dsymutil_of_a_command_is_its_program_and_environment() {
+    let mut command = Command::new("/usr/bin/dsymutil");
+    command
+        .env_clear()
+        .env("DEVELOPER_DIR", "/Applications/Xcode.app")
+        .env("PATH", "/usr/bin")
+        .env_remove("TOOLCHAINS");
+    let dsymutil = Dsymutil::from_command(&command).unwrap();
+    assert_eq!(dsymutil.program, "/usr/bin/dsymutil");
+    let mut env = dsymutil.env.clone();
+    env.sort();
+    assert_eq!(
+        env,
+        [
+            (
+                "DEVELOPER_DIR".to_string(),
+                "/Applications/Xcode.app".to_string()
+            ),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dsymutil_that_cannot_travel_as_text_is_none() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let odd = std::ffi::OsStr::from_bytes(b"\xff");
+    assert_eq!(Dsymutil::from_command(&Command::new(odd)), None);
+    let mut command = Command::new("dsymutil");
+    command.env("NAME", odd);
+    assert_eq!(Dsymutil::from_command(&command), None);
+    let mut command = Command::new("dsymutil");
+    command.env(odd, "value");
+    assert_eq!(Dsymutil::from_command(&command), None);
 }
 
 #[test]
@@ -78,14 +141,12 @@ struct Fixture {
     handoff: PathBuf,
     executable: PathBuf,
     depinfo: PathBuf,
+    dsymutil: Dsymutil,
 }
 
-fn make_fixture(objects: &[&str]) -> Option<Fixture> {
+fn make_fixture(objects: &[&str]) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    if !clones_files(&root) {
-        return None;
-    }
     let profile = root.join("target/debug");
     let deps = profile.join("deps");
     std::fs::create_dir_all(&deps).unwrap();
@@ -97,13 +158,17 @@ fn make_fixture(objects: &[&str]) -> Option<Fixture> {
     std::fs::write(&executable, synthetic_macho(Some(UUID), &symbols)).unwrap();
     let depinfo = root.join("private-demo.d");
     std::fs::write(&depinfo, b"demo: src/main.rs\n").unwrap();
-    Some(Fixture {
+    Fixture {
         handoff: root.join("cache/staging/handoff"),
         _dir: dir,
         profile,
         executable,
         depinfo,
-    })
+        dsymutil: Dsymutil {
+            program: "dsymutil".to_string(),
+            env: vec![("DEVELOPER_DIR".to_string(), "/xcode".to_string())],
+        },
+    }
 }
 
 const OBJECTS: &[&str] = &[
@@ -126,6 +191,8 @@ impl Fixture {
             path: &self.executable,
             store_name: "demo-1234",
             oso_root: &self.profile,
+            sysroot: Some(Path::new("/toolchain")),
+            dsymutil: &self.dsymutil,
         }
     }
 
@@ -142,10 +209,14 @@ impl Fixture {
 
 #[test]
 fn capture_clones_the_executable_its_objects_and_the_entry_files() {
-    let Some(fixture) = make_fixture(OBJECTS) else {
-        return;
-    };
-    let capture = capture(&fixture.handoff, &fixture.files(), &fixture.linked()).unwrap();
+    let fixture = make_fixture(OBJECTS);
+    let capture = capture(
+        &fixture.handoff,
+        &fixture.files(),
+        &fixture.linked(),
+        &copy_clone,
+    )
+    .unwrap();
 
     assert_eq!(capture.dir.parent(), Some(fixture.handoff.as_path()));
     assert!(
@@ -189,7 +260,7 @@ fn capture_clones_the_executable_its_objects_and_the_entry_files() {
 #[test]
 fn a_capture_that_fails_leaves_nothing_behind() {
     let failing = |fixture: &Fixture, files: &[(PathBuf, String)], expected: &str| {
-        let error = capture(&fixture.handoff, files, &fixture.linked()).unwrap_err();
+        let error = capture(&fixture.handoff, files, &fixture.linked(), &copy_clone).unwrap_err();
         assert!(format!("{error:#}").contains(expected), "{error:#}");
         assert!(
             fixture.staging_dirs().is_empty(),
@@ -198,19 +269,13 @@ fn a_capture_that_fails_leaves_nothing_behind() {
         );
     };
 
-    let Some(missing) = make_fixture(&["deps/missing.o"]) else {
-        return;
-    };
+    let missing = make_fixture(&["deps/missing.o"]);
     failing(&missing, &missing.files(), "missing.o");
 
-    let Some(escaping) = make_fixture(&["deps/../escape.o"]) else {
-        return;
-    };
+    let escaping = make_fixture(&["deps/../escape.o"]);
     failing(&escaping, &escaping.files(), "unexpected OSO path");
 
-    let Some(unprefixed) = make_fixture(&[]) else {
-        return;
-    };
+    let unprefixed = make_fixture(&[]);
     let inside = unprefixed.profile.join("deps/a.o");
     let symbols = [(N_OSO, inside.to_str().unwrap())];
     std::fs::write(
@@ -218,17 +283,16 @@ fn a_capture_that_fails_leaves_nothing_behind() {
         synthetic_macho(Some(UUID), &symbols),
     )
     .unwrap();
-    failing(&unprefixed, &unprefixed.files(), "not relative");
+    failing(&unprefixed, &unprefixed.files(), "sysroot");
 
-    let Some(script) = make_fixture(OBJECTS) else {
-        return;
-    };
+    let native = make_fixture(&["/repo/native/build/libfoo.a(foo.o)"]);
+    failing(&native, &native.files(), "/repo/native/build/libfoo.a");
+
+    let script = make_fixture(OBJECTS);
     std::fs::write(&script.executable, b"#!/bin/sh\n").unwrap();
     failing(&script, &script.files(), "Mach-O");
 
-    let Some(unlisted) = make_fixture(OBJECTS) else {
-        return;
-    };
+    let unlisted = make_fixture(OBJECTS);
     failing(&unlisted, &unlisted.files()[1..], "not among");
 }
 
@@ -321,6 +385,7 @@ fn request(config: &Config, staging: &Path) -> PublishRustcDebugRequest {
     PublishRustcDebugRequest {
         client_version: Some(crate::VERSION.to_owned()),
         cache_key: key("demo"),
+        lock_key: key("demo shared"),
         crate_name: "demo".to_string(),
         crate_types: vec!["bin".to_string()],
         features: vec![],
@@ -350,6 +415,8 @@ fn request(config: &Config, staging: &Path) -> PublishRustcDebugRequest {
             .to_string_lossy()
             .into_owned(),
         uuid: uuid_hex(&UUID),
+        dsymutil: "dsymutil".to_string(),
+        dsymutil_env: vec![("DEVELOPER_DIR".to_string(), "/xcode".to_string())],
     }
 }
 
@@ -362,8 +429,10 @@ fn only_a_sound_request_validates() {
     assert_eq!(validate(&config, &good), Ok(UUID));
 
     type Spoil = fn(&mut PublishRustcDebugRequest);
-    let invalid: [(&str, Spoil); 12] = [
+    let invalid: [(&str, Spoil); 14] = [
         ("key", |r| r.cache_key = "../x".to_string()),
+        ("lock key", |r| r.lock_key = "../x".to_string()),
+        ("dsymutil", |r| r.dsymutil.clear()),
         ("outside", |r| {
             r.staging_dir = "/tmp/dsym-stage-abc".to_string()
         }),
@@ -552,7 +621,7 @@ fn the_recorded_binary_path_names_the_installed_executable() {
     let plain = format!("binary-path: {from}\r\nother: x");
     assert_eq!(
         rewrite_binary_path(&plain, from, "/b").unwrap(),
-        "binary-path: /b\r\nother: x"
+        "binary-path: '/b'\r\nother: x"
     );
     let quoted_from = "/stage/it's";
     assert_eq!(
@@ -567,6 +636,72 @@ fn the_recorded_binary_path_names_the_installed_executable() {
         rewrite_binary_path(&format!("path: '{from}'\n"), from, to),
         None
     );
+}
+
+/// LLVM double-quotes any value with a byte outside ASCII (checked against
+/// Apple dsymutil 21: `"/x/ünï \"q\" dir/hé'x"`), and the synchronous path
+/// writes the installed path that way.
+#[test]
+fn non_ascii_paths_are_matched_and_written_double_quoted() {
+    let staged = "/cache/staging/handoff/dsym-job-a/bin/hé'x";
+    let installed = "/work/ünï \"q\" dir/deps/hé'x";
+    let text = "binary-path:     \"/cache/staging/handoff/dsym-job-a/bin/hé'x\"\n";
+    assert_eq!(
+        rewrite_binary_path(text, staged, installed).unwrap(),
+        "binary-path:     \"/work/ünï \\\"q\\\" dir/deps/hé'x\"\n"
+    );
+    // An ASCII staging path, single-quoted, becomes a double-quoted target.
+    assert_eq!(
+        rewrite_binary_path("binary-path: '/s/b'\n", "/s/b", "/wörk/b").unwrap(),
+        "binary-path: \"/wörk/b\"\n"
+    );
+}
+
+#[test]
+fn values_are_quoted_as_llvm_quotes_them() {
+    assert_eq!(yaml_scalar("/a/b"), "'/a/b'");
+    assert_eq!(yaml_scalar("/a/it's"), "'/a/it''s'");
+    assert_eq!(yaml_scalar("/a\tb"), "'/a\tb'");
+    assert_eq!(yaml_scalar("/a\nb"), "'/a\nb'");
+    assert_eq!(yaml_scalar("/a\rb"), "'/a\rb'");
+    assert_eq!(yaml_scalar("/é"), "\"/é\"");
+    assert_eq!(yaml_scalar("/a\x7f"), "\"/a\x7f\"");
+    assert_eq!(yaml_scalar("/a\x01"), "\"/a\\x01\"");
+    assert_eq!(
+        yaml_double_quoted("\\\"\0\x07\x08\t\n\x0b\x0c\r\x1b\x1f\u{85}\u{a0}\u{2028}\u{2029}é"),
+        "\"\\\\\\\"\\0\\a\\b\\t\\n\\v\\f\\r\\e\\x1F\\N\\_\\L\\Pé\""
+    );
+}
+
+#[test]
+fn only_old_install_leftovers_of_this_executable_are_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = ".demo.dSYM.kache-";
+    let make = |name: &str, age: Duration| {
+        let path = dir.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        let time = std::time::SystemTime::now() - age;
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(time)).unwrap();
+        path
+    };
+    let hour = Duration::from_secs(3600);
+    let old = make(".demo.dSYM.kache-old", hour * 2);
+    let young = make(".demo.dSYM.kache-young", Duration::ZERO);
+    let other = make(".other.dSYM.kache-old", hour * 2);
+    let file = dir.path().join(".demo.dSYM.kache-file");
+    std::fs::write(&file, b"x").unwrap();
+    filetime::set_file_mtime(
+        &file,
+        filetime::FileTime::from_system_time(std::time::SystemTime::now() - hour * 2),
+    )
+    .unwrap();
+    remove_install_leftovers(dir.path(), prefix, hour);
+    assert!(!old.exists());
+    assert!(young.exists());
+    assert!(other.exists());
+    assert!(file.exists());
+    // A directory that does not exist is no error.
+    remove_install_leftovers(&dir.path().join("missing"), prefix, hour);
 }
 
 #[test]
@@ -665,7 +800,12 @@ fn exchanging_into_place_keeps_the_replaced_tree_at_the_staged_path() {
 /// A stand-in for `dsymutil`: writes a bundle with a relocation file naming
 /// the executable it was given, from the directory it runs in.
 #[cfg(unix)]
-fn fake_dsymutil(executable: &Path, bundle: &Path, objects: &Path) -> Command {
+fn fake_dsymutil(
+    _: &PublishRustcDebugRequest,
+    executable: &Path,
+    bundle: &Path,
+    objects: &Path,
+) -> Command {
     let script = r#"set -e
 mkdir -p "$2/Contents/Resources/DWARF" "$2/Contents/Resources/Relocations/aarch64"
 cat deps/a.o > "$2/Contents/Resources/DWARF/demo-1234"
@@ -681,19 +821,27 @@ printf "binary-path:     '%s'\n" "$1" > "$2/Contents/Resources/Relocations/aarch
 }
 
 #[cfg(unix)]
-fn failing_dsymutil(_: &Path, _: &Path, _: &Path) -> Command {
+fn failing_dsymutil(_: &PublishRustcDebugRequest, _: &Path, _: &Path, _: &Path) -> Command {
     let mut command = Command::new("sh");
     command.args(["-c", "echo 'cannot read' >&2; exit 3"]);
     command
 }
 
-/// A job directory as the daemon has it after accepting `fixture`.
-fn accepted_job(fixture: &Fixture, config: &Config) -> DebugBundleJob {
-    let capture = capture(&handoff_dir(config), &fixture.files(), &fixture.linked()).unwrap();
-    let entry = EntryFields {
-        cache_key: &key("demo"),
+#[cfg(unix)]
+fn hanging_dsymutil(_: &PublishRustcDebugRequest, _: &Path, _: &Path, _: &Path) -> Command {
+    let mut command = Command::new("sh");
+    command.args(["-c", "exec sleep 30"]);
+    command
+}
+
+const NO_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn entry_fields(cache_key: &str) -> EntryFields<'_> {
+    EntryFields {
+        cache_key,
+        lock_key: cache_key,
         crate_name: "demo",
-        crate_types: &["bin".to_string()],
+        crate_types: &[],
         features: &[],
         target: "host",
         profile: "dev",
@@ -703,8 +851,20 @@ fn accepted_job(fixture: &Fixture, config: &Config) -> DebugBundleJob {
         stderr: "",
         compile_time_ms: 9,
         publishes_to_remote: false,
-    };
-    let request = request_for(&entry, &fixture.linked(), &capture);
+    }
+}
+
+/// A job directory as the daemon has it after accepting `fixture`.
+fn accepted_job(fixture: &Fixture, config: &Config) -> DebugBundleJob {
+    let capture = capture(
+        &handoff_dir(config),
+        &fixture.files(),
+        &fixture.linked(),
+        &copy_clone,
+    )
+    .unwrap();
+    let cache_key = key("demo");
+    let request = request_for(&entry_fields(&cache_key), &fixture.linked(), &capture);
     let uuid = validate(config, &request).unwrap();
     let dir = take_staging(&handoff_dir(config), &capture.dir).unwrap();
     DebugBundleJob { request, dir, uuid }
@@ -717,25 +877,61 @@ fn fixture_config(fixture: &Fixture) -> Config {
     config
 }
 
+#[test]
+fn the_daemon_runs_the_builds_dsymutil_in_the_builds_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let mut request = request(&config, &handoff_dir(&config).join("dsym-stage-a"));
+    request.dsymutil = "/opt/xcode/dsymutil".to_string();
+    request.dsymutil_env = vec![("DEVELOPER_DIR".to_string(), "/opt/xcode".to_string())];
+    let command = dsymutil_command(
+        &request,
+        Path::new("/job/bin/demo"),
+        Path::new("/job/out/demo.dSYM"),
+        Path::new("/job/objects"),
+    );
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let tail = ["-j", "2", "/job/bin/demo", "-o", "/job/out/demo.dSYM"];
+    assert!(args.ends_with(&tail.map(String::from)), "{args:?}");
+    let program = command.get_program().to_string_lossy().into_owned();
+    if program == "/usr/sbin/taskpolicy" {
+        assert_eq!(args[..3], ["-c", "background", "/opt/xcode/dsymutil"]);
+        assert_eq!(args.len(), 3 + tail.len());
+    } else {
+        assert_eq!(program, "/opt/xcode/dsymutil");
+        assert_eq!(args.len(), tail.len());
+    }
+    let envs: Vec<_> = command.get_envs().collect();
+    assert_eq!(
+        envs,
+        [(
+            std::ffi::OsStr::new("DEVELOPER_DIR"),
+            Some(std::ffi::OsStr::new("/opt/xcode"))
+        )]
+    );
+    assert_eq!(command.get_current_dir(), Some(Path::new("/job/objects")));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_job_builds_installs_and_tars_the_bundle() {
-    let Some(fixture) = make_fixture(OBJECTS) else {
-        return;
-    };
+    let fixture = make_fixture(OBJECTS);
     let config = fixture_config(&fixture);
     let job = accepted_job(&fixture, &config);
     // The build rewrites its object after the wrapper returned.
     std::fs::write(fixture.profile.join("deps/a.o"), b"next build").unwrap();
 
-    let files = run_job(&job, &fake_dsymutil).unwrap();
+    let (files, bundled) = entry_files(&job, &fake_dsymutil, NO_TIMEOUT);
+    assert!(bundled);
     let names: Vec<_> = files.iter().map(|(_, name)| name.as_str()).collect();
     assert_eq!(names, ["demo-1234", "demo-1234.d", "demo-1234.dsym.tar"]);
     assert!(files.iter().all(|(path, _)| path.starts_with(&job.dir)));
 
-    let installed = fixture
-        .profile
-        .join("deps/demo-1234.dSYM/Contents/Resources");
+    let bundle = fixture.profile.join("deps/demo-1234.dSYM");
+    let installed = bundle.join("Contents/Resources");
     assert_eq!(
         std::fs::read(installed.join("DWARF/demo-1234")).unwrap(),
         b"object a",
@@ -745,6 +941,12 @@ fn a_job_builds_installs_and_tars_the_bundle() {
         std::fs::read_to_string(installed.join("Relocations/aarch64/demo-1234.yml")).unwrap(),
         format!("binary-path:     '{}'\n", fixture.executable.display())
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&bundle).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
 
     let mut archive = tar::Archive::new(std::fs::File::open(&files[2].0).unwrap());
     let mut entries: Vec<_> = archive
@@ -771,23 +973,35 @@ fn a_job_builds_installs_and_tars_the_bundle() {
 
 #[cfg(unix)]
 #[test]
-fn a_job_whose_dsymutil_fails_yields_no_files() {
-    let Some(fixture) = make_fixture(OBJECTS) else {
-        return;
-    };
+fn a_failed_dsymutil_leaves_the_entry_without_a_bundle() {
+    let fixture = make_fixture(OBJECTS);
     let config = fixture_config(&fixture);
     let job = accepted_job(&fixture, &config);
-    let error = run_job(&job, &failing_dsymutil).unwrap_err();
+    let error = build_bundle(&job, &failing_dsymutil, NO_TIMEOUT).unwrap_err();
     assert!(format!("{error:#}").contains("cannot read"), "{error:#}");
+    let (files, bundled) = entry_files(&job, &failing_dsymutil, NO_TIMEOUT);
+    assert!(!bundled);
+    let names: Vec<_> = files.iter().map(|(_, name)| name.as_str()).collect();
+    assert_eq!(names, ["demo-1234", "demo-1234.d"]);
     assert!(!fixture.profile.join("deps/demo-1234.dSYM").exists());
 }
 
 #[cfg(unix)]
 #[test]
+fn a_hung_dsymutil_is_killed_at_its_timeout() {
+    let fixture = make_fixture(OBJECTS);
+    let config = fixture_config(&fixture);
+    let job = accepted_job(&fixture, &config);
+    let started = std::time::Instant::now();
+    let error = build_bundle(&job, &hanging_dsymutil, Duration::from_millis(200)).unwrap_err();
+    assert!(format!("{error:#}").contains("was killed"), "{error:#}");
+    assert!(started.elapsed() < Duration::from_secs(20));
+}
+
+#[cfg(unix)]
+#[test]
 fn a_processed_job_stores_one_entry_and_removes_its_directory() {
-    let Some(fixture) = make_fixture(OBJECTS) else {
-        return;
-    };
+    let fixture = make_fixture(OBJECTS);
     let config = fixture_config(&fixture);
     let daemon = Arc::new(Daemon::new(config.clone()));
     let store = Store::open(&config).unwrap();
@@ -795,7 +1009,7 @@ fn a_processed_job_stores_one_entry_and_removes_its_directory() {
     let job = accepted_job(&fixture, &config);
     let job_dir = job.dir.clone();
     assert_eq!(
-        process_job(&daemon, &config, &store, job, &fake_dsymutil),
+        process_job(&daemon, &config, &store, job, &fake_dsymutil, NO_TIMEOUT),
         JobOutcome::Stored
     );
     assert!(!job_dir.exists());
@@ -808,7 +1022,7 @@ fn a_processed_job_stores_one_entry_and_removes_its_directory() {
     let job = accepted_job(&fixture, &config);
     let job_dir = job.dir.clone();
     assert_eq!(
-        process_job(&daemon, &config, &store, job, &fake_dsymutil),
+        process_job(&daemon, &config, &store, job, &fake_dsymutil, NO_TIMEOUT),
         JobOutcome::PeerStored
     );
     assert!(!job_dir.exists());
@@ -816,55 +1030,107 @@ fn a_processed_job_stores_one_entry_and_removes_its_directory() {
 
 #[cfg(unix)]
 #[test]
-fn a_failed_or_dropped_job_stores_nothing_and_removes_its_directory() {
-    let Some(fixture) = make_fixture(OBJECTS) else {
-        return;
-    };
+fn a_job_whose_bundle_fails_still_caches_the_executable() {
+    let fixture = make_fixture(OBJECTS);
     let config = fixture_config(&fixture);
     let daemon = Arc::new(Daemon::new(config.clone()));
     let store = Store::open(&config).unwrap();
-
     let job = accepted_job(&fixture, &config);
     let job_dir = job.dir.clone();
     assert_eq!(
-        process_job(&daemon, &config, &store, job, &failing_dsymutil),
-        JobOutcome::Failed
+        process_job(&daemon, &config, &store, job, &failing_dsymutil, NO_TIMEOUT),
+        JobOutcome::StoredWithoutBundle
     );
     assert!(!job_dir.exists());
-    assert!(store.get(&key("demo")).unwrap().is_none());
+    let meta = store.get(&key("demo")).unwrap().expect("stored");
+    let mut names: Vec<_> = meta.files.iter().map(|file| file.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["demo-1234", "demo-1234.d"]);
+}
 
+#[cfg(unix)]
+#[test]
+fn a_dropped_job_stores_nothing_and_removes_its_directory() {
+    let fixture = make_fixture(OBJECTS);
+    let config = fixture_config(&fixture);
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let store = Store::open(&config).unwrap();
     let job = accepted_job(&fixture, &config);
     let job_dir = job.dir.clone();
     daemon.debug_bundle_queue().close();
     assert_eq!(
-        process_job(&daemon, &config, &store, job, &fake_dsymutil),
+        process_job(&daemon, &config, &store, job, &fake_dsymutil, NO_TIMEOUT),
         JobOutcome::Dropped
     );
     assert!(!job_dir.exists());
     assert!(store.get(&key("demo")).unwrap().is_none());
 }
 
+#[cfg(unix)]
 #[test]
-fn a_claim_waits_for_a_peer_and_never_takes_a_committed_key() {
+fn a_job_whose_put_fails_stores_nothing() {
+    let fixture = make_fixture(OBJECTS);
+    let config = fixture_config(&fixture);
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let store = Store::open(&config).unwrap();
+    let job = accepted_job(&fixture, &config);
+    // The entry's executable vanished from the job: the put cannot read it.
+    std::fs::remove_file(job.dir.join(&job.request.executable)).unwrap();
+    assert_eq!(
+        process_job(&daemon, &config, &store, job, &failing_dsymutil, NO_TIMEOUT),
+        JobOutcome::Failed
+    );
+    assert!(store.get(&key("demo")).unwrap().is_none());
+}
+
+/// Store a one-file entry under `cache_key`.
+fn put_entry(store: &Store, dir: &Path, cache_key: &str) {
+    let file = dir.join(format!("{cache_key}.rlib"));
+    std::fs::write(&file, cache_key).unwrap();
+    store
+        .put_rustc_with_compile_time(
+            cache_key,
+            "peer",
+            &[],
+            &[],
+            "host",
+            "dev",
+            &[(file, "libpeer.rlib".to_string())],
+            "",
+            "",
+            1,
+            None,
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_claim_takes_the_wrappers_lock_and_never_a_stored_entry() {
     let dir = tempfile::tempdir().unwrap();
     let config = crate::test_support::test_config(dir.path().join("cache"));
     let store = Store::open(&config).unwrap();
     let peer = Store::open(&config).unwrap();
-    let cache_key = key("claimed");
+    let (shared, width) = (key("shared"), key("width"));
+    let wait = Duration::from_millis(50);
 
-    let BuildClaim::Acquired(held) = peer.claim_build(&cache_key).unwrap() else {
-        panic!("fresh key");
-    };
-    // The peer keeps it past the wait and stores nothing: not ours.
-    assert!(
-        claim(&store, &cache_key, Duration::from_millis(50))
-            .unwrap()
-            .is_none()
-    );
+    // A peer holds the shared lock past the wait: not ours, whichever entry
+    // key the job stores under.
+    let held = peer.try_lock(&shared).unwrap().expect("free");
+    assert!(claim(&store, &shared, &width, wait).unwrap().is_none());
     drop(held);
-    // Free again: ours.
-    let lock = claim(&store, &cache_key, Duration::from_millis(50)).unwrap();
+    // Free again: ours, and it is the shared key's lock that is held.
+    let lock = claim(&store, &shared, &width, wait).unwrap();
     assert!(lock.is_some());
+    assert!(peer.try_lock(&shared).unwrap().is_none());
+    drop(lock);
+
+    // An entry under the shared key does not stop a width key's job...
+    put_entry(&store, dir.path(), &shared);
+    assert!(claim(&store, &shared, &width, wait).unwrap().is_some());
+    // ...but a stored entry under its own key does, lock free or not.
+    put_entry(&store, dir.path(), &width);
+    assert!(claim(&store, &shared, &width, wait).unwrap().is_none());
+    assert!(claim(&store, &shared, &shared, wait).unwrap().is_none());
 }
 
 /// The whole deferred path with the real toolchain: a `-g` C executable
@@ -876,15 +1142,14 @@ fn a_claim_waits_for_a_peer_and_never_takes_a_committed_key() {
 #[test]
 fn a_deferred_bundle_matches_the_synchronous_one_and_resolves_lines() {
     use crate::compiler::platform::Platform as _;
-    use crate::compiler::platform::tests::{compile_debug_c_binary, relink_c_binary};
+    use crate::compiler::platform::tests::{
+        compile_debug_c_binary, host_tool_unavailable, relink_c_binary,
+    };
     if std::env::consts::OS != "macos" {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    if !clones_files(&root) {
-        return;
-    }
     let profile = root.join("target/debug");
     let deps = profile.join("deps");
     std::fs::create_dir_all(&deps).unwrap();
@@ -907,39 +1172,35 @@ fn a_deferred_bundle_matches_the_synchronous_one_and_resolves_lines() {
     let mut config = crate::test_support::test_config(root.join("cache"));
     config.auto_gc = false;
     let files = vec![(binary.clone(), "hello-bin".to_string())];
+    let env = crate::invocation::InvocationEnv::capture();
+    let dsymutil = Dsymutil::from_command(&env.command("dsymutil").unwrap()).unwrap();
     let linked = LinkedExecutable {
         path: &binary,
         store_name: "hello-bin",
         oso_root: &profile,
+        sysroot: None,
+        dsymutil: &dsymutil,
     };
-    let capture = capture(&handoff_dir(&config), &files, &linked).unwrap();
+    let capture = match capture(&handoff_dir(&config), &files, &linked, &clone_file) {
+        Ok(capture) => capture,
+        Err(error) => {
+            let _: Option<()> = host_tool_unavailable("clonefile", &format!("{error:#}"));
+            return;
+        }
+    };
     assert!(capture.dir.join("objects/deps/hello.o").is_file());
     // The next build rewrites the object before the job runs.
     std::fs::write(deps.join("hello.o"), b"not an object any more").unwrap();
 
-    let entry = EntryFields {
-        cache_key: &key("hello"),
-        crate_name: "hello",
-        crate_types: &["bin".to_string()],
-        features: &[],
-        target: "host",
-        profile: "dev",
-        rustc_identity: None,
-        unit: None,
-        stdout: "",
-        stderr: "",
-        compile_time_ms: 1,
-        publishes_to_remote: false,
-    };
-    let request = request_for(&entry, &linked, &capture);
+    let cache_key = key("hello");
+    let request = request_for(&entry_fields(&cache_key), &linked, &capture);
     let uuid = validate(&config, &request).unwrap();
     let dir = take_staging(&handoff_dir(&config), &capture.dir).unwrap();
     let job = DebugBundleJob { request, dir, uuid };
 
-    let deferred_files = run_job(&job, &dsymutil_command).unwrap();
-    let deferred_tar = &deferred_files.last().unwrap().0;
+    let deferred_tar = build_bundle(&job, &dsymutil_command, NO_TIMEOUT).unwrap();
     assert_eq!(
-        std::fs::read(deferred_tar).unwrap(),
+        std::fs::read(&deferred_tar).unwrap(),
         std::fs::read(&sync_tar).unwrap(),
         "deferred and synchronous bundles are the same bytes"
     );
@@ -947,10 +1208,10 @@ fn a_deferred_bundle_matches_the_synchronous_one_and_resolves_lines() {
     let store = Store::open(&config).unwrap();
     let daemon = Arc::new(Daemon::new(config.clone()));
     assert_eq!(
-        process_job(&daemon, &config, &store, job, &dsymutil_command),
+        process_job(&daemon, &config, &store, job, &dsymutil_command, NO_TIMEOUT),
         JobOutcome::Stored
     );
-    let meta = store.get(&key("hello")).unwrap().expect("stored");
+    let meta = store.get(&cache_key).unwrap().expect("stored");
     let tar = meta
         .files
         .iter()

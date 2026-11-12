@@ -5198,6 +5198,7 @@ fn run_parsed_rustc(
             &result,
             DeferredEntry {
                 cache_key: &entry_key.key,
+                lock_key: &cache_key,
                 crate_name,
                 target,
                 profile,
@@ -5214,6 +5215,7 @@ fn run_parsed_rustc(
                     crate::build_script::is_launcher_compilation(args),
                 )
             },
+            &DeferralHost::LIVE,
         )
     {
         record_input_prediction(config, Some(&store), args, record_closure, &key_outputs);
@@ -5456,6 +5458,8 @@ fn rustc_identity_for(args: &RustcArgs) -> Option<String> {
 /// The fields of a deferred entry the store path has already worked out.
 struct DeferredEntry<'a> {
     cache_key: &'a str,
+    /// The key whose lock this invocation holds: the shared key.
+    lock_key: &'a str,
     crate_name: &'a str,
     target: &'a str,
     profile: &'a str,
@@ -5477,6 +5481,7 @@ fn defers_debug_bundle(
 /// the caller then only logs. On `false` nothing was changed and the
 /// synchronous path runs: no daemon, another store volume, an output that is
 /// not a thin Mach-O, a clone that failed, or a refusal.
+#[allow(clippy::too_many_arguments)]
 fn hand_off_deferred_debug_bundle(
     config: &Config,
     store: &Store,
@@ -5485,11 +5490,12 @@ fn hand_off_deferred_debug_bundle(
     result: &crate::compile::CompileResult,
     entry: DeferredEntry<'_>,
     prepare: impl FnOnce() -> Result<PreparedRustcStoreFiles>,
+    host: &DeferralHost<'_>,
 ) -> bool {
-    use crate::debug_bundle_handoff::{EntryFields, Handoff, LinkedExecutable};
-    if !defers_debug_bundle(config.macos_debug_bundle, std::env::consts::OS, args)
+    use crate::debug_bundle_handoff::{Dsymutil, EntryFields, Handoff, LinkedExecutable};
+    if !defers_debug_bundle(config.macos_debug_bundle, host.os, args)
         || !volume_cache_dirs_match(store.cache_dir(), &config.cache_dir)
-        || !crate::daemon::existing_daemon_run_lock_is_held(&config.socket_path()).unwrap_or(false)
+        || !(host.daemon_running)(config)
     {
         return false;
     }
@@ -5504,6 +5510,15 @@ fn hand_off_deferred_debug_bundle(
     let Some(oso_root) = platform::dsymutil_oso_root(&executable) else {
         return false;
     };
+    // The program and environment the synchronous path would give dsymutil.
+    let Some(dsymutil) = env
+        .command("dsymutil")
+        .ok()
+        .and_then(|command| Dsymutil::from_command(&command))
+    else {
+        return false;
+    };
+    let sysroot = (host.sysroot)(args);
     let prepared = match prepare() {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -5524,6 +5539,7 @@ fn hand_off_deferred_debug_bundle(
     let rustc_identity = rustc_identity_for(args);
     let fields = EntryFields {
         cache_key: entry.cache_key,
+        lock_key: entry.lock_key,
         crate_name: entry.crate_name,
         crate_types: &args.crate_types,
         features: &args.features,
@@ -5540,8 +5556,10 @@ fn hand_off_deferred_debug_bundle(
         path: &executable,
         store_name: &store_name,
         oso_root: &oso_root,
+        sysroot: sysroot.as_deref(),
+        dsymutil: &dsymutil,
     };
-    match crate::debug_bundle_handoff::hand_off(config, &fields, &files, &linked) {
+    match (host.hand_off)(config, &fields, &files, &linked) {
         Handoff::Accepted => true,
         Handoff::Declined(reason) => {
             tracing::debug!(
@@ -5551,6 +5569,35 @@ fn hand_off_deferred_debug_bundle(
             false
         }
     }
+}
+
+/// What [`hand_off_deferred_debug_bundle`] asks of the host; tests supply
+/// their own.
+struct DeferralHost<'a> {
+    os: &'a str,
+    daemon_running: &'a dyn Fn(&Config) -> bool,
+    sysroot: &'a dyn Fn(&RustcArgs) -> Option<PathBuf>,
+    hand_off: &'a DeferredHandOff<'a>,
+}
+
+/// [`crate::debug_bundle_handoff::hand_off`]'s shape.
+type DeferredHandOff<'a> = dyn Fn(
+        &Config,
+        &crate::debug_bundle_handoff::EntryFields<'_>,
+        &[(PathBuf, String)],
+        &crate::debug_bundle_handoff::LinkedExecutable<'_>,
+    ) -> crate::debug_bundle_handoff::Handoff
+    + 'a;
+
+impl DeferralHost<'static> {
+    const LIVE: Self = Self {
+        os: std::env::consts::OS,
+        daemon_running: &|config| {
+            crate::daemon::existing_daemon_run_lock_is_held(&config.socket_path()).unwrap_or(false)
+        },
+        sysroot: &|args| crate::cache_key::get_rustc_sysroot_for(args, args.invocation_env()),
+        hand_off: &crate::debug_bundle_handoff::hand_off,
+    };
 }
 
 struct PreparedCcStoreFiles {
