@@ -780,7 +780,7 @@ fn build_bundle(
     let installed = Path::new(&request.installed_executable);
     point_relocations_at(&bundle, &executable, installed)?;
     match install_beside(&bundle, installed, &job.uuid) {
-        Ok(true) => {}
+        Ok(true) => link_uplifted_bundle(installed, &job.uuid),
         Ok(false) => tracing::debug!(
             "{} was replaced after its link; its bundle is only stored",
             installed.display()
@@ -1012,6 +1012,101 @@ fn install_beside(bundle: &Path, installed: &Path, uuid: &[u8; 16]) -> Result<bo
     // guard removes it.
     drop(staged);
     Ok(true)
+}
+
+/// Give Cargo's uplifted copy of `installed` the `.dSYM` link Cargo gives it
+/// when the bundle exists in time. Best effort: a failure is only logged.
+///
+/// Cargo's `link_targets` walks a unit's outputs in `file_types` order, the
+/// executable before its `.dSYM`. It copies the executable up (`fs::copy`
+/// on macOS, so the copy keeps the `LC_UUID`), then skips the `.dSYM` if it
+/// does not exist yet, and symlinks it if it does (`paths::link_or_copy`,
+/// relative to the link's directory). A deferred bundle lands after rustc
+/// returned. Either Cargo found it and made the link, or the copy is
+/// already in place when this runs and the link is made here, as Cargo
+/// would have made it.
+fn link_uplifted_bundle(installed: &Path, uuid: &[u8; 16]) {
+    match uplift_bundle_link(installed, uuid) {
+        Ok(Some(link)) => tracing::debug!("linked {}", link.display()),
+        Ok(None) => {}
+        Err(error) => tracing::debug!(
+            "could not link the uplifted bundle of {}: {error:#}",
+            installed.display()
+        ),
+    }
+}
+
+/// Create `<uplifted>.dSYM` for the uplifted copy of `installed`, if there
+/// is one with `uuid` and it has no `.dSYM` yet. Returns the link created.
+///
+/// A `deps/<name>-<hash>` executable is uplifted to the profile directory,
+/// and the link is `deps/<name>-<hash>.dSYM`. An example stays in
+/// `examples/`, and the link is `<name>-<hash>.dSYM`.
+fn uplift_bundle_link(installed: &Path, uuid: &[u8; 16]) -> Result<Option<PathBuf>> {
+    let file = installed
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("the executable has no file name")?;
+    let dir = installed
+        .parent()
+        .context("the executable has no parent directory")?;
+    let bundle = format!("{file}.dSYM");
+    let (uplift_dir, target) = if dir.file_name().is_some_and(|name| name == "deps") {
+        (
+            dir.parent().context("deps has no parent directory")?,
+            Path::new("deps").join(&bundle),
+        )
+    } else {
+        (dir, PathBuf::from(&bundle))
+    };
+    for name in uplifted_names(file) {
+        let uplifted = uplift_dir.join(&name);
+        let is_file = std::fs::symlink_metadata(&uplifted).is_ok_and(|meta| meta.is_file());
+        if !is_file || !has_uuid(&uplifted, uuid) {
+            continue;
+        }
+        let link = uplift_dir.join(format!("{name}.dSYM"));
+        if std::fs::symlink_metadata(&link).is_ok() {
+            // Cargo's own link, or one already pointing at this bundle.
+            return Ok(None);
+        }
+        symlink_dir(&target, &link).with_context(|| format!("linking {}", link.display()))?;
+        return Ok(Some(link));
+    }
+    Ok(None)
+}
+
+/// The names Cargo may have uplifted `file` to: the name without the
+/// `-<16 hex>` metadata hash, as the crate name spells it and with `_` as
+/// `-` (a bin `my-bin` is `deps/my_bin-<hash>`). None without such a hash.
+fn uplifted_names(file: &str) -> Vec<String> {
+    let Some((stem, hash)) = file.rsplit_once('-') else {
+        return Vec::new();
+    };
+    let is_hash = hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !is_hash || stem.is_empty() {
+        return Vec::new();
+    }
+    let hyphenated = stem.replace('_', "-");
+    if hyphenated == stem {
+        vec![stem.to_owned()]
+    } else {
+        vec![stem.to_owned(), hyphenated]
+    }
+}
+
+#[cfg(unix)]
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+/// Uplift links are a macOS concern; nothing links elsewhere.
+#[cfg(not(unix))]
+fn symlink_dir(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "directory links are not made off Unix",
+    ))
 }
 
 fn has_uuid(executable: &Path, uuid: &[u8; 16]) -> bool {
