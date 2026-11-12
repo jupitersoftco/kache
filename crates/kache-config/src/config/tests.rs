@@ -932,6 +932,67 @@ fn index_mode_defaults_to_auto_and_obeys_invocation_precedence() {
 }
 
 #[test]
+fn macos_debug_bundle_defaults_to_sync_and_obeys_invocation_precedence() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let loaded = |value: Option<&str>| {
+        let mut vars = vec![
+            (
+                "KACHE_CONFIG".to_owned(),
+                config_path.to_string_lossy().into_owned(),
+            ),
+            ("KACHE_HOST_CONFIG".into(), String::new()),
+        ];
+        if let Some(value) = value {
+            vars.push(("KACHE_MACOS_DEBUG_BUNDLE".into(), value.into()));
+        }
+        let invocation = InvocationEnv::from_parts(
+            vars,
+            Some(dir.path().to_owned()),
+            Some(dir.path().to_owned()),
+            dir.path().to_owned(),
+        );
+        Config::load_for(&invocation).unwrap().macos_debug_bundle
+    };
+
+    assert_eq!(loaded(None), MacosDebugBundle::Sync);
+
+    std::fs::write(&config_path, "[cache]\nmacos_debug_bundle = \"deferred\"\n").unwrap();
+    assert_eq!(loaded(None), MacosDebugBundle::Deferred);
+    // The environment wins over the file, and an unknown value falls through.
+    assert_eq!(loaded(Some(" Sync ")), MacosDebugBundle::Sync);
+    assert_eq!(loaded(Some("later")), MacosDebugBundle::Deferred);
+
+    std::fs::write(&config_path, "[cache]\nmacos_debug_bundle = \"sync\"\n").unwrap();
+    assert_eq!(loaded(Some("DEFERRED")), MacosDebugBundle::Deferred);
+
+    std::fs::write(&config_path, "[cache]\nmacos_debug_bundle = \"async\"\n").unwrap();
+    assert_eq!(loaded(None), MacosDebugBundle::Sync);
+
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\nmacos_debug_bundle = \"deferred\"\n",
+    )
+    .unwrap();
+    assert_eq!(loaded(Some("sync")), MacosDebugBundle::Deferred);
+}
+
+#[test]
+fn macos_debug_bundle_parses_only_its_two_modes() {
+    assert_eq!(
+        MacosDebugBundle::parse("sync"),
+        Some(MacosDebugBundle::Sync)
+    );
+    assert_eq!(
+        MacosDebugBundle::parse("\tDeferred\n"),
+        Some(MacosDebugBundle::Deferred)
+    );
+    for other in ["", "off", "defer", "syncdeferred"] {
+        assert_eq!(MacosDebugBundle::parse(other), None, "{other:?}");
+    }
+}
+
+#[test]
 fn store_config_carries_the_index_mode() {
     let dir = tempfile::tempdir().unwrap();
     for (value, expected) in [
@@ -3342,6 +3403,7 @@ fn test_file_config_roundtrip() {
             out_dir_alias_root: None,
             deferred_durability: None,
             daemon_publish: None,
+            macos_debug_bundle: None,
             trust_daemon_execution: None,
             native_runtime_warmup: None,
             daemon_execution_concurrency: None,
@@ -4014,6 +4076,7 @@ fn test_config_store_dir() {
         daemon_publish: false,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
+        macos_debug_bundle: Default::default(),
         daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
@@ -4113,6 +4176,7 @@ fn test_config_index_db_path() {
         daemon_publish: false,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
+        macos_debug_bundle: Default::default(),
         daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
@@ -4208,6 +4272,7 @@ fn test_config_event_log_path() {
         daemon_publish: false,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
+        macos_debug_bundle: Default::default(),
         daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
@@ -4322,6 +4387,7 @@ fn test_config_socket_path() {
         daemon_publish: false,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
+        macos_debug_bundle: Default::default(),
         daemon_execution_concurrency: None,
         project_rules: ProjectRules::default(),
         auto_gc: true,
@@ -5071,6 +5137,7 @@ fn test_save_and_load_file_config() {
             out_dir_alias_root: None,
             deferred_durability: None,
             daemon_publish: None,
+            macos_debug_bundle: None,
             trust_daemon_execution: None,
             native_runtime_warmup: None,
             daemon_execution_concurrency: None,

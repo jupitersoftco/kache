@@ -24,6 +24,7 @@ use crate::link::LinkStrategy;
 
 pub mod cc;
 pub mod flags;
+pub(crate) mod macho_debug_map;
 pub mod nvcc;
 pub mod platform;
 pub mod rustc;

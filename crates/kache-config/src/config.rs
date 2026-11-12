@@ -563,6 +563,11 @@ pub struct Config {
     /// false` keeps every put in the wrapper. Without a reachable daemon the
     /// wrapper stores on its own either way.
     pub daemon_publish: bool,
+    /// When a cached macOS executable with unpacked debug info gets its
+    /// `.dSYM` bundle: `sync` (default) runs `dsymutil` before the wrapper
+    /// returns; `deferred` hands it to a running daemon together with the
+    /// store. `KACHE_MACOS_DEBUG_BUNDLE` or `[cache] macos_debug_bundle`.
+    pub macos_debug_bundle: MacosDebugBundle,
     /// Prepare cold MSVC runtime hashes in the daemon while native units compile.
     /// The first units may run without caching. Disable with
     /// `KACHE_NATIVE_RUNTIME_WARMUP=0` or `[cache] native_runtime_warmup = false`
@@ -1023,6 +1028,8 @@ pub struct CacheFileConfig {
     pub index_mode: Option<String>,
     /// Daemon hand-off toggle. See [`Config::daemon_publish`].
     pub daemon_publish: Option<bool>,
+    /// macOS debug bundle timing. See [`Config::macos_debug_bundle`].
+    pub macos_debug_bundle: Option<String>,
     /// Background MSVC runtime hashing. See [`Config::native_runtime_warmup`].
     pub native_runtime_warmup: Option<bool>,
     pub trust_daemon_execution: Option<bool>,
@@ -1488,6 +1495,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_SHARED_HARDLINK_RESTORES",
     "KACHE_DEFERRED_DISCOVERY",
     "KACHE_DAEMON_PUBLISH",
+    "KACHE_MACOS_DEBUG_BUNDLE",
     "KACHE_NATIVE_RUNTIME_WARMUP",
     "KACHE_TRUST_DAEMON_EXECUTION",
     "KACHE_DAEMON_EXECUTION_CONCURRENCY",
@@ -1625,6 +1633,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_DEFERRED_DURABILITY", "cache.deferred_durability"),
     ("KACHE_INDEX_MODE", "cache.index_mode"),
     ("KACHE_DAEMON_PUBLISH", "cache.daemon_publish"),
+    ("KACHE_MACOS_DEBUG_BUNDLE", "cache.macos_debug_bundle"),
     ("KACHE_NATIVE_RUNTIME_WARMUP", "cache.native_runtime_warmup"),
     (
         "KACHE_TRUST_DAEMON_EXECUTION",
@@ -2484,6 +2493,7 @@ impl Config {
         let deferred_durability = Self::deferred_durability_enabled_for(invocation, &file_config);
         let index_mode = Self::index_mode_for(invocation, &file_config);
         let daemon_publish = Self::daemon_publish_enabled_for(invocation, &file_config);
+        let macos_debug_bundle = Self::macos_debug_bundle_for(invocation, &file_config);
         let native_runtime_warmup =
             Self::native_runtime_warmup_enabled_for(invocation, &file_config);
         let trust_daemon_execution = Self::trust_daemon_execution_for(invocation, &file_config);
@@ -2639,6 +2649,7 @@ impl Config {
             deferred_durability,
             index_mode,
             daemon_publish,
+            macos_debug_bundle,
             native_runtime_warmup,
             trust_daemon_execution,
             daemon_execution_concurrency,
@@ -3438,6 +3449,28 @@ impl Config {
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.index_mode.as_deref())
                     .and_then(|value| parse_index_mode(value, "cache.index_mode"))
+            })
+            .unwrap_or_default()
+    }
+
+    /// `KACHE_MACOS_DEBUG_BUNDLE` (env wins), else
+    /// `[cache] macos_debug_bundle`, else `sync`. An unknown value warns and
+    /// falls through to the next source. See [`Config::macos_debug_bundle`].
+    fn macos_debug_bundle_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> MacosDebugBundle {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        env_or_ignored_for(invocation, "KACHE_MACOS_DEBUG_BUNDLE", ignore_env)
+            .ok()
+            .and_then(|value| parse_macos_debug_bundle(&value, "KACHE_MACOS_DEBUG_BUNDLE"))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.macos_debug_bundle.as_deref())
+                    .and_then(|value| parse_macos_debug_bundle(value, "cache.macos_debug_bundle"))
             })
             .unwrap_or_default()
     }
@@ -5387,6 +5420,45 @@ fn parse_index_mode(value: &str, source: &str) -> Option<IndexMode> {
         tracing::warn!(
             "ignoring unknown index mode {value:?} from {source}: expected `auto`, \
              `conservative`, or `off`; falling back to the next configured source or the default"
+        );
+    }
+    parsed
+}
+
+/// When a cached macOS executable with unpacked debug info gets the `.dSYM`
+/// bundle that is stored with it (kunobi-ninja/kache#319).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MacosDebugBundle {
+    /// `dsymutil` runs before the wrapper returns to Cargo.
+    #[default]
+    Sync,
+    /// A running daemon runs `dsymutil` from link-time clones of the
+    /// executable and its objects, then stores executable and bundle as one
+    /// entry. Without a daemon that accepts the job the wrapper runs `sync`.
+    Deferred,
+}
+
+impl MacosDebugBundle {
+    /// `sync` or `deferred`, ignoring case and surrounding space.
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("sync") {
+            Some(Self::Sync)
+        } else if value.eq_ignore_ascii_case("deferred") {
+            Some(Self::Deferred)
+        } else {
+            None
+        }
+    }
+}
+
+/// Parse a debug bundle mode, warning when it is set but unknown.
+fn parse_macos_debug_bundle(value: &str, source: &str) -> Option<MacosDebugBundle> {
+    let parsed = MacosDebugBundle::parse(value);
+    if parsed.is_none() {
+        tracing::warn!(
+            "ignoring unknown macOS debug bundle mode {value:?} from {source}: expected `sync` \
+             or `deferred`; falling back to the next configured source or the default"
         );
     }
     parsed
