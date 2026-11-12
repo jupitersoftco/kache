@@ -82,6 +82,9 @@ pub struct PublishRustcDebugRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
     pub cache_key: String,
+    /// The key whose lock the wrapper held for this compile: the shared key,
+    /// which also covers a terminal-width `cache_key`.
+    pub lock_key: String,
     pub crate_name: String,
     pub crate_types: Vec<String>,
     pub features: Vec<String>,
@@ -110,6 +113,10 @@ pub struct PublishRustcDebugRequest {
     pub installed_executable: String,
     /// `LC_UUID` of the executable, as 32 lowercase hex digits.
     pub uuid: String,
+    /// The `dsymutil` the synchronous path would run, as the build resolved
+    /// it, and the build's whole environment to run it in.
+    pub dsymutil: String,
+    pub dsymutil_env: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -121,6 +128,7 @@ mod tests {
         let request = PublishRustcDebugRequest {
             client_version: Some("9.9.9".to_string()),
             cache_key: "k".to_string(),
+            lock_key: "k".to_string(),
             crate_name: "demo".to_string(),
             crate_types: vec!["bin".to_string()],
             features: vec![],
@@ -138,6 +146,8 @@ mod tests {
             bundle_store_name: "demo.dsym.tar".to_string(),
             installed_executable: "/t/demo".to_string(),
             uuid: "0".repeat(32),
+            dsymutil: "/usr/bin/dsymutil".to_string(),
+            dsymutil_env: vec![("DEVELOPER_DIR".to_string(), "/x".to_string())],
         };
         let envelope = crate::Request::PublishRustcDebug(Box::new(request));
         assert_eq!(envelope.client_version(), Some("9.9.9"));

@@ -41,7 +41,7 @@ use crate::compiler::macho_debug_map::{oso_file, read_debug_map_at, uuid_hex};
 use crate::config::Config;
 use crate::daemon::{Daemon, Request, Response};
 use crate::daemon_publish::{HandoffFile, handoff_dir};
-use crate::store::{BuildClaim, KeyLock, Store};
+use crate::store::{KeyLock, Store};
 
 pub(crate) use kache_protocol::PublishRustcDebugRequest;
 
@@ -75,6 +75,12 @@ const DSYMUTIL_THREADS: &str = "2";
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a finished job waits for a peer that holds the key.
 const PEER_WAIT: Duration = Duration::from_secs(30);
+/// How long one `dsymutil` may run before it is killed, so a hung run cannot
+/// hold a worker. The executable is then stored without a bundle.
+const DSYMUTIL_TIMEOUT: Duration = Duration::from_secs(600);
+/// Age after which a sibling `.<name>.dSYM.kache-*` directory is taken to be
+/// one a stopped daemon left behind mid-install.
+const INSTALL_LEFTOVER_AGE: Duration = Duration::from_secs(3600);
 
 /// Whether this compile's bundle is one to defer: the configuration asks for
 /// it, the host is macOS, and the executable's objects are still on disk
@@ -95,6 +101,8 @@ pub(crate) fn wanted(
 /// What the entry records besides its files.
 pub(crate) struct EntryFields<'a> {
     pub(crate) cache_key: &'a str,
+    /// The key whose lock the wrapper holds (see [`PublishRustcDebugRequest::lock_key`]).
+    pub(crate) lock_key: &'a str,
     pub(crate) crate_name: &'a str,
     pub(crate) crate_types: &'a [String],
     pub(crate) features: &'a [String],
@@ -116,6 +124,37 @@ pub(crate) struct LinkedExecutable<'a> {
     pub(crate) store_name: &'a str,
     /// The `-oso_prefix` root its relative `N_OSO` paths resolve against.
     pub(crate) oso_root: &'a Path,
+    /// The sysroot of the rustc that linked it. Its rlibs are the only
+    /// absolute `N_OSO` paths a job may read where they are.
+    pub(crate) sysroot: Option<&'a Path>,
+    /// The `dsymutil` to run.
+    pub(crate) dsymutil: &'a Dsymutil,
+}
+
+/// The `dsymutil` the synchronous path would run: the program as the build's
+/// environment names it, and that whole environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Dsymutil {
+    pub(crate) program: String,
+    pub(crate) env: Vec<(String, String)>,
+}
+
+impl Dsymutil {
+    /// What `command` runs: its program and every variable it sets. The
+    /// synchronous path's command clears the environment first, so these are
+    /// all it sees. A program or variable that is not UTF-8 cannot travel in
+    /// a request, and the caller keeps the synchronous path.
+    pub(crate) fn from_command(command: &Command) -> Option<Self> {
+        let program = command.get_program().to_str()?.to_owned();
+        let mut env = Vec::new();
+        for (name, value) in command.get_envs() {
+            let Some(value) = value else {
+                continue;
+            };
+            env.push((name.to_str()?.to_owned(), value.to_str()?.to_owned()));
+        }
+        Some(Self { program, env })
+    }
 }
 
 /// Outcome of offering a deferred bundle to the daemon.
@@ -142,7 +181,7 @@ pub(crate) fn hand_off(
     if !socket.exists() {
         return Handoff::Declined("no daemon socket".to_string());
     }
-    let capture = match capture(&handoff_dir(config), files, executable) {
+    let capture = match capture(&handoff_dir(config), files, executable, &clone_file) {
         Ok(capture) => capture,
         Err(error) => return Handoff::Declined(format!("capture failed: {error:#}")),
     };
@@ -184,10 +223,13 @@ impl Drop for StagingGuard {
 }
 
 /// Fill a new staging directory under `parent` with link-time clones.
+/// `clone` makes each copy of the executable and its objects: copy-on-write
+/// in production ([`clone_file`]).
 fn capture(
     parent: &Path,
     files: &[(PathBuf, String)],
     executable: &LinkedExecutable<'_>,
+    clone: &dyn Fn(&Path, &Path) -> Result<()>,
 ) -> Result<Capture> {
     let _trace = crate::phase_trace::phase("debug_bundle_capture");
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -207,7 +249,7 @@ fn capture(
     let executable_rel = format!("{EXECUTABLE_DIR}/{file_name}");
     let executable_clone = dir.join(&executable_rel);
     std::fs::create_dir(dir.join(EXECUTABLE_DIR))?;
-    clone_file(executable.path, &executable_clone)?;
+    clone(executable.path, &executable_clone)?;
 
     // Read the clone, not the original: its debug map is the one `dsymutil`
     // will read, whatever happens to the original meanwhile.
@@ -217,7 +259,7 @@ fn capture(
     let objects = dir.join(OBJECTS_DIR);
     std::fs::create_dir(&objects)?;
     for entry in &map.objects {
-        let Some(relative) = object_to_capture(oso_file(entry), executable.oso_root)? else {
+        let Some(relative) = object_to_capture(oso_file(entry), executable.sysroot)? else {
             continue;
         };
         let target = objects.join(relative);
@@ -227,7 +269,7 @@ fn capture(
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        clone_file(&executable.oso_root.join(relative), &target)?;
+        clone(&executable.oso_root.join(relative), &target)?;
     }
 
     std::fs::create_dir(dir.join(FILES_DIR))?;
@@ -260,21 +302,28 @@ fn capture(
 }
 
 /// The path to clone for one `N_OSO` file, relative to the `-oso_prefix`
-/// root, or `None` for an absolute path outside it (the toolchain's own
-/// rlibs, which no build rewrites; `dsymutil` reads them where they are).
-/// An absolute path inside the root means the prefix did not apply, and a
-/// relative one must not leave the root: both decline the deferral.
-fn object_to_capture<'a>(file: &'a str, oso_root: &Path) -> Result<Option<&'a Path>> {
+/// root, or `None` for an rlib of the toolchain's sysroot, which no build
+/// rewrites; `dsymutil` reads those where they are. Any other absolute path
+/// (a static archive a build script wrote and may rewrite, or an object the
+/// prefix did not strip) and a relative path that leaves the root decline
+/// the deferral.
+fn object_to_capture<'a>(file: &'a str, sysroot: Option<&Path>) -> Result<Option<&'a Path>> {
     let path = Path::new(file);
     if path.is_absolute() {
         ensure!(
-            !path.starts_with(oso_root),
-            "{file} is under the OSO root but not relative to it"
+            sysroot.is_some_and(|sysroot| in_sysroot(path, sysroot)),
+            "{file} is outside the -oso_prefix root and the toolchain sysroot"
         );
         return Ok(None);
     }
     ensure!(is_plain_relative(path), "unexpected OSO path {file}");
     Ok(Some(path))
+}
+
+/// Under `sysroot` as spelled, or as it resolves through links.
+fn in_sysroot(path: &Path, sysroot: &Path) -> bool {
+    path.starts_with(sysroot)
+        || std::fs::canonicalize(sysroot).is_ok_and(|real| path.starts_with(real))
 }
 
 /// Non-empty, and only normal components: no root, `.` or `..`.
@@ -323,6 +372,7 @@ fn request_for(
     PublishRustcDebugRequest {
         client_version: Some(crate::VERSION.to_owned()),
         cache_key: entry.cache_key.to_owned(),
+        lock_key: entry.lock_key.to_owned(),
         crate_name: entry.crate_name.to_owned(),
         crate_types: entry.crate_types.to_vec(),
         features: entry.features.to_vec(),
@@ -340,6 +390,8 @@ fn request_for(
         bundle_store_name: format!("{}.dsym.tar", executable.store_name),
         installed_executable: executable.path.to_string_lossy().into_owned(),
         uuid: uuid_hex(&capture.uuid),
+        dsymutil: executable.dsymutil.program.clone(),
+        dsymutil_env: executable.dsymutil.env.clone(),
     }
 }
 
@@ -425,8 +477,13 @@ fn refused(reason: &str) -> Response {
 
 /// Why `request` cannot be a job, or the executable's UUID when it can.
 fn validate(config: &Config, request: &PublishRustcDebugRequest) -> Result<[u8; 16], String> {
-    if !crate::cache_key::is_valid_cache_key(&request.cache_key) {
+    if !crate::cache_key::is_valid_cache_key(&request.cache_key)
+        || !crate::cache_key::is_valid_cache_key(&request.lock_key)
+    {
         return Err("invalid cache key".to_string());
+    }
+    if request.dsymutil.is_empty() {
+        return Err("no dsymutil".to_string());
     }
     let staging = Path::new(&request.staging_dir);
     let owned = staging.parent() == Some(handoff_dir(config).as_path())
@@ -572,7 +629,14 @@ fn run_worker(
     while let Some(job) = rx.lock().ok().and_then(|mut rx| rx.blocking_recv()) {
         match &store {
             Ok(store) => {
-                process_job(daemon, &config, store, job, &dsymutil_command);
+                process_job(
+                    daemon,
+                    &config,
+                    store,
+                    job,
+                    &dsymutil_command,
+                    DSYMUTIL_TIMEOUT,
+                );
             }
             Err(error) => {
                 let _cleanup = StagingGuard(Some(job.dir));
@@ -582,14 +646,21 @@ fn run_worker(
     }
 }
 
+/// Builds the `dsymutil` command for a job: the request, then the staged
+/// executable, the bundle to write and the directory to run in.
+type DsymutilCommand = dyn Fn(&PublishRustcDebugRequest, &Path, &Path, &Path) -> Command;
+
 /// How one job ended.
 #[derive(Debug, PartialEq, Eq)]
 enum JobOutcome {
     /// Executable and bundle are stored as one entry.
     Stored,
+    /// The bundle failed and the executable is stored without one, as the
+    /// synchronous path does.
+    StoredWithoutBundle,
     /// A peer stored the key first.
     PeerStored,
-    /// The bundle or the put failed; nothing is stored.
+    /// The put failed; nothing is stored.
     Failed,
     /// The daemon is stopping; nothing is stored.
     Dropped,
@@ -602,7 +673,8 @@ fn process_job(
     config: &Config,
     store: &Store,
     job: DebugBundleJob,
-    dsymutil: &dyn Fn(&Path, &Path, &Path) -> Command,
+    dsymutil: &DsymutilCommand,
+    timeout: Duration,
 ) -> JobOutcome {
     let _cleanup = StagingGuard(Some(job.dir.clone()));
     let crate_name = &job.request.crate_name;
@@ -610,15 +682,7 @@ fn process_job(
     if daemon.debug_bundle_queue().is_closing() {
         return JobOutcome::Dropped;
     }
-    let files = match run_job(&job, dsymutil) {
-        Ok(files) => files,
-        Err(error) => {
-            tracing::warn!(
-                "deferred debug bundle for {crate_name} failed, not caching it: {error:#}"
-            );
-            return JobOutcome::Failed;
-        }
-    };
+    let (files, bundled) = entry_files(&job, dsymutil, timeout);
     if daemon.debug_bundle_queue().is_closing() {
         return JobOutcome::Dropped;
     }
@@ -635,10 +699,15 @@ fn process_job(
                 );
             }
             tracing::info!(
-                "stored {crate_name} with its deferred debug bundle after {} ms",
+                "stored {crate_name} {} its deferred debug bundle after {} ms",
+                if bundled { "with" } else { "without" },
                 started.elapsed().as_millis()
             );
-            JobOutcome::Stored
+            if bundled {
+                JobOutcome::Stored
+            } else {
+                JobOutcome::StoredWithoutBundle
+            }
         }
         Ok(false) => {
             tracing::debug!("{crate_name}: a peer stored the key first");
@@ -646,7 +715,7 @@ fn process_job(
         }
         Err(error) => {
             tracing::warn!(
-                "could not store {crate_name} with its deferred debug bundle: {}",
+                "could not store {crate_name} from its deferred debug bundle job: {}",
                 crate::wrapper::store_error_for_event(&error)
             );
             JobOutcome::Failed
@@ -654,12 +723,43 @@ fn process_job(
     }
 }
 
-/// Build the bundle, place it next to the build's executable, and return the
-/// entry's files with the bundle tar, `(absolute path, store name)`.
-fn run_job(
+/// The entry's files, `(absolute path, store name)`, with the bundle tar when
+/// the bundle could be built, and whether it could. A bundle that fails
+/// leaves the executable to be stored without one, with a warning: what the
+/// synchronous path does.
+fn entry_files(
     job: &DebugBundleJob,
-    dsymutil: &dyn Fn(&Path, &Path, &Path) -> Command,
-) -> Result<Vec<(PathBuf, String)>> {
+    dsymutil: &DsymutilCommand,
+    timeout: Duration,
+) -> (Vec<(PathBuf, String)>, bool) {
+    let mut files: Vec<(PathBuf, String)> = job
+        .request
+        .files
+        .iter()
+        .map(|file| (job.dir.join(&file.path), file.store_name.clone()))
+        .collect();
+    match build_bundle(job, dsymutil, timeout) {
+        Ok(tar) => {
+            files.push((tar, job.request.bundle_store_name.clone()));
+            (files, true)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "deferred debug bundle for {} failed, caching it without one: {error:#}",
+                job.request.crate_name
+            );
+            (files, false)
+        }
+    }
+}
+
+/// Run `dsymutil`, place the bundle next to the build's executable, and tar
+/// it. Returns the tar.
+fn build_bundle(
+    job: &DebugBundleJob,
+    dsymutil: &DsymutilCommand,
+    timeout: Duration,
+) -> Result<PathBuf> {
     let request = &job.request;
     let executable = job.dir.join(&request.executable);
     let name = executable
@@ -672,24 +772,11 @@ fn run_job(
     let objects = job.dir.join(OBJECTS_DIR);
     std::fs::create_dir_all(&objects)?;
     let bundle = output.join(format!("{name}.dSYM"));
-    let result = dsymutil(&executable, &bundle, &objects)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .context("running dsymutil")?;
-    if !result.status.success() {
-        bail!(
-            "dsymutil exited with {}: {}",
-            result.status,
-            String::from_utf8_lossy(&result.stderr).trim()
-        );
-    }
-    if !result.stderr.is_empty() {
-        tracing::debug!(
-            "dsymutil for {}: {}",
-            request.crate_name,
-            String::from_utf8_lossy(&result.stderr).trim()
-        );
-    }
+    run_bounded(
+        dsymutil(request, &executable, &bundle, &objects),
+        &job.dir.join("dsymutil.log"),
+        timeout,
+    )?;
     let installed = Path::new(&request.installed_executable);
     point_relocations_at(&bundle, &executable, installed)?;
     match install_beside(&bundle, installed, &job.uuid) {
@@ -705,28 +792,73 @@ fn run_job(
     }
     let tar = job.dir.join(&request.bundle_store_name);
     crate::compiler::platform::build_deterministic_tar(&bundle, &tar)?;
-    let mut files: Vec<(PathBuf, String)> = request
-        .files
-        .iter()
-        .map(|file| (job.dir.join(&file.path), file.store_name.clone()))
-        .collect();
-    files.push((tar, request.bundle_store_name.clone()));
-    Ok(files)
+    Ok(tar)
 }
 
-/// `dsymutil -j 2 <executable> -o <bundle>` from `objects`, the mirror of the
-/// `-oso_prefix` root, clamped to background priority where macOS offers
-/// `taskpolicy`.
-fn dsymutil_command(executable: &Path, bundle: &Path, objects: &Path) -> Command {
+/// Run `command` to completion within `timeout`, its stderr in `log`. A run
+/// past the timeout is killed. An exit other than success is an error that
+/// carries the end of `log`.
+fn run_bounded(mut command: Command, log: &Path, timeout: Duration) -> Result<()> {
+    let stderr = std::fs::File::create(log).context("creating the dsymutil log")?;
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .context("starting dsymutil")?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("waiting for dsymutil")? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "dsymutil ran longer than {} s and was killed",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let output = std::fs::read_to_string(log).unwrap_or_default();
+    let output = output.trim();
+    if !status.success() {
+        let tail = &output[output.len().saturating_sub(4096)..];
+        bail!("dsymutil exited with {status}: {tail}");
+    }
+    if !output.is_empty() {
+        tracing::debug!("dsymutil: {output}");
+    }
+    Ok(())
+}
+
+/// The command the synchronous path runs (`dsymutil <executable> -o
+/// <bundle>`, the build's program and environment), from `objects`, the
+/// mirror of the `-oso_prefix` root. Adds `-j 2` and clamps it to background
+/// priority where macOS offers `taskpolicy`.
+fn dsymutil_command(
+    request: &PublishRustcDebugRequest,
+    executable: &Path,
+    bundle: &Path,
+    objects: &Path,
+) -> Command {
     const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
     let mut command = if Path::new(TASKPOLICY).exists() {
         let mut command = Command::new(TASKPOLICY);
-        command.args(["-c", "background", "dsymutil"]);
+        command.args(["-c", "background"]).arg(&request.dsymutil);
         command
     } else {
-        Command::new("dsymutil")
+        Command::new(&request.dsymutil)
     };
     command
+        .env_clear()
+        .envs(
+            request
+                .dsymutil_env
+                .iter()
+                .map(|(name, value)| (name, value)),
+        )
         .args(["-j", DSYMUTIL_THREADS])
         .arg(executable)
         .arg("-o")
@@ -762,10 +894,10 @@ fn point_relocations_at(bundle: &Path, read_from: &Path, installed: &Path) -> Re
 }
 
 /// `text` with its `binary-path:` value `from` replaced by `to`, or `None`
-/// when no such line is there. LLVM writes the value single-quoted, with
-/// `'` doubled; a plain value is replaced as written.
+/// when no such line is there. The value is matched in each spelling LLVM's
+/// YAML writer can give it, and `to` is written the way that writer would.
 fn rewrite_binary_path(text: &str, from: &str, to: &str) -> Option<String> {
-    let quote = |path: &str| format!("'{}'", path.replace('\'', "''"));
+    let spellings = [yaml_single_quoted(from), yaml_double_quoted(from)];
     let mut out = String::with_capacity(text.len());
     let mut changed = false;
     for line in text.split_inclusive('\n') {
@@ -773,15 +905,11 @@ fn rewrite_binary_path(text: &str, from: &str, to: &str) -> Option<String> {
         let ending = &line[body.len()..];
         if let Some(value) = body.strip_prefix("binary-path:") {
             let padding = &value[..value.len() - value.trim_start().len()];
-            let replacement = match value.trim() {
-                quoted if quoted == quote(from) => Some(quote(to)),
-                plain if plain == from => Some(to.to_owned()),
-                _ => None,
-            };
-            if let Some(replacement) = replacement {
+            let value = value.trim();
+            if value == from || spellings.iter().any(|spelling| spelling == value) {
                 out.push_str("binary-path:");
                 out.push_str(padding);
-                out.push_str(&replacement);
+                out.push_str(&yaml_scalar(to));
                 out.push_str(ending);
                 changed = true;
                 continue;
@@ -792,15 +920,63 @@ fn rewrite_binary_path(text: &str, from: &str, to: &str) -> Option<String> {
     changed.then_some(out)
 }
 
+/// `value` as LLVM's YAML writer quotes a path (`yaml::needsQuotes`): any
+/// byte outside ASCII, `DEL` or a control character other than tab, line feed
+/// and carriage return needs double quotes; otherwise single quotes, which a
+/// path's `/` always needs.
+fn yaml_scalar(value: &str) -> String {
+    let double = value
+        .bytes()
+        .any(|byte| byte >= 0x7f || (byte < 0x20 && !matches!(byte, b'\t' | b'\n' | b'\r')));
+    if double {
+        yaml_double_quoted(value)
+    } else {
+        yaml_single_quoted(value)
+    }
+}
+
+fn yaml_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// LLVM's `yaml::escape` without escaping printable characters.
+fn yaml_double_quoted(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\0' => out.push_str("\\0"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\x0b' => out.push_str("\\v"),
+            '\x0c' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            '\x1b' => out.push_str("\\e"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02X}", c as u32)),
+            '\u{85}' => out.push_str("\\N"),
+            '\u{a0}' => out.push_str("\\_"),
+            '\u{2028}' => out.push_str("\\L"),
+            '\u{2029}' => out.push_str("\\P"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Put a copy of `bundle` at `<installed>.dSYM` if `installed` still has
 /// `uuid`, replacing whatever bundle is there in one rename. `Ok(false)`
-/// when the executable is gone or was relinked: its own job, or a restore,
-/// supplies its bundle. A bundle that lands after a relink anyway is
-/// harmless, because lldb ignores a `.dSYM` whose UUID does not match.
+/// when the executable is gone or was relinked, checked before the copy and
+/// again just before the rename: its own job, or a restore, supplies its
+/// bundle. A bundle that lands after a relink anyway is harmless, because
+/// lldb ignores a `.dSYM` whose UUID does not match.
 fn install_beside(bundle: &Path, installed: &Path, uuid: &[u8; 16]) -> Result<bool> {
-    match read_debug_map_at(installed) {
-        Ok(Some(map)) if map.uuid == *uuid => {}
-        _ => return Ok(false),
+    if !has_uuid(installed, uuid) {
+        return Ok(false);
     }
     let name = installed
         .file_name()
@@ -809,14 +985,25 @@ fn install_beside(bundle: &Path, installed: &Path, uuid: &[u8; 16]) -> Result<bo
     let parent = installed
         .parent()
         .context("the executable has no parent directory")?;
+    let prefix = format!(".{name}.dSYM.kache-");
+    remove_install_leftovers(parent, &prefix, INSTALL_LEFTOVER_AGE);
     let staged = StagingGuard(Some(
         tempfile::Builder::new()
-            .prefix(&format!(".{name}.dSYM.kache-"))
+            .prefix(&prefix)
             .tempdir_in(parent)?
             .keep(),
     ));
     let staged_path = staged.0.clone().expect("armed guard");
+    // tempfile creates 0700; a `.dSYM` is read by whoever debugs the build.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o755))?;
+    }
     copy_tree(bundle, &staged_path)?;
+    if !has_uuid(installed, uuid) {
+        return Ok(false);
+    }
     exchange_into_place(
         &staged_path,
         &installed.with_file_name(format!("{name}.dSYM")),
@@ -825,6 +1012,38 @@ fn install_beside(bundle: &Path, installed: &Path, uuid: &[u8; 16]) -> Result<bo
     // guard removes it.
     drop(staged);
     Ok(true)
+}
+
+fn has_uuid(executable: &Path, uuid: &[u8; 16]) -> bool {
+    matches!(read_debug_map_at(executable), Ok(Some(map)) if map.uuid == *uuid)
+}
+
+/// Remove `prefix` directories in `dir` older than `age`: what an install
+/// leaves when its daemon stops between the copy and the rename. Only this
+/// executable's own prefix is matched, and a younger one may be another
+/// job's install in progress.
+fn remove_install_leftovers(dir: &Path, prefix: &str, age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|modified| {
+                now.duration_since(modified)
+                    .is_ok_and(|elapsed| elapsed >= age)
+            });
+        let ours = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(prefix))
+            && entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if ours && old {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Copy the tree under `source` into the existing directory `target`.
@@ -882,7 +1101,7 @@ fn publish(
     request: &PublishRustcDebugRequest,
     files: &[(PathBuf, String)],
 ) -> Result<bool> {
-    let Some(_lock) = claim(store, &request.cache_key, PEER_WAIT)? else {
+    let Some(_lock) = claim(store, &request.lock_key, &request.cache_key, PEER_WAIT)? else {
         return Ok(false);
     };
     store.put_rustc_with_compile_time(
@@ -909,22 +1128,29 @@ fn publish(
     Ok(true)
 }
 
-/// The key's lock, or `None` when a peer committed it. A peer still holding
-/// it gets `wait` to finish.
-fn claim(store: &Store, cache_key: &str, wait: Duration) -> Result<Option<KeyLock>> {
-    match store.claim_build(cache_key)? {
-        BuildClaim::Acquired(lock) => Ok(Some(lock)),
-        BuildClaim::Committed(_) => Ok(None),
-        BuildClaim::Contended => {
-            if store.wait_for_committed_with_timeout(cache_key, wait)? {
-                return Ok(None);
-            }
-            match store.claim_build(cache_key)? {
-                BuildClaim::Acquired(lock) => Ok(Some(lock)),
-                BuildClaim::Committed(_) | BuildClaim::Contended => Ok(None),
+/// The lock the wrapper held, on `lock_key` (the shared key, which also
+/// covers a width key), or `None` when `entry_key` is already stored. A peer
+/// still holding the lock gets `wait` to finish.
+fn claim(
+    store: &Store,
+    lock_key: &str,
+    entry_key: &str,
+    wait: Duration,
+) -> Result<Option<KeyLock>> {
+    let lock = match store.try_lock(lock_key)? {
+        Some(lock) => lock,
+        None => {
+            store.wait_for_committed_with_timeout(lock_key, wait)?;
+            match store.try_lock(lock_key)? {
+                Some(lock) => lock,
+                None => return Ok(None),
             }
         }
+    };
+    if store.contains(entry_key) {
+        return Ok(None);
     }
+    Ok(Some(lock))
 }
 
 /// Utility priority for the worker's own tar and store work; `dsymutil` is
