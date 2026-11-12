@@ -779,6 +779,121 @@ fn the_bundle_is_placed_next_to_the_executable_it_was_built_from() {
 }
 
 #[test]
+fn uplifted_names_drop_the_metadata_hash() {
+    assert_eq!(uplifted_names("kfx-6b24f3748a65f4ab"), ["kfx"]);
+    assert_eq!(
+        uplifted_names("my_bin-0123456789abcdef"),
+        ["my_bin", "my-bin"]
+    );
+    for none in [
+        "kfx",
+        "kfx-6b24f3748a65f4a",
+        "kfx-6b24f3748a65f4abc",
+        "kfx-6b24f3748a65f4ag",
+        "-6b24f3748a65f4ab",
+    ] {
+        assert!(uplifted_names(none).is_empty(), "{none:?}");
+    }
+}
+
+/// `dir/name` as a synthetic executable with `uuid`.
+fn executable_at(dir: &Path, name: &str, uuid: [u8; 16]) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, synthetic_macho(Some(uuid), &[])).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn the_uplifted_executable_gets_cargos_bundle_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("release");
+    let installed = executable_at(&profile.join("deps"), "kfx-6b24f3748a65f4ab", UUID);
+    executable_at(&profile, "kfx", UUID);
+
+    let link = uplift_bundle_link(&installed, &UUID).unwrap();
+    assert_eq!(link, Some(profile.join("kfx.dSYM")));
+    assert_eq!(
+        std::fs::read_link(profile.join("kfx.dSYM")).unwrap(),
+        Path::new("deps/kfx-6b24f3748a65f4ab.dSYM")
+    );
+    // An existing link is Cargo's, or already this one: left alone.
+    assert_eq!(uplift_bundle_link(&installed, &UUID).unwrap(), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hyphenated_bin_and_an_example_are_linked_where_cargo_links_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("debug");
+    let installed = executable_at(&profile.join("deps"), "my_bin-0123456789abcdef", UUID);
+    executable_at(&profile, "my-bin", UUID);
+    assert_eq!(
+        uplift_bundle_link(&installed, &UUID).unwrap(),
+        Some(profile.join("my-bin.dSYM"))
+    );
+
+    let examples = profile.join("examples");
+    let example = executable_at(&examples, "demo-0123456789abcdef", UUID);
+    executable_at(&examples, "demo", UUID);
+    assert_eq!(
+        uplift_bundle_link(&example, &UUID).unwrap(),
+        Some(examples.join("demo.dSYM"))
+    );
+    assert_eq!(
+        std::fs::read_link(examples.join("demo.dSYM")).unwrap(),
+        Path::new("demo-0123456789abcdef.dSYM")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn only_an_uplifted_copy_of_the_same_link_is_linked() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("release");
+    let deps = profile.join("deps");
+    let installed = executable_at(&deps, "kfx-6b24f3748a65f4ab", UUID);
+
+    // Not uplifted (a test harness), or no metadata hash: nothing.
+    assert_eq!(uplift_bundle_link(&installed, &UUID).unwrap(), None);
+    let plain = executable_at(&deps, "kfx", UUID);
+    assert_eq!(uplift_bundle_link(&plain, &UUID).unwrap(), None);
+
+    // Uplifted from another link.
+    executable_at(&profile, "kfx", OTHER_UUID);
+    assert_eq!(uplift_bundle_link(&installed, &UUID).unwrap(), None);
+    assert!(std::fs::symlink_metadata(profile.join("kfx.dSYM")).is_err());
+
+    // A link, not a file, in the uplifted executable's place.
+    std::fs::remove_file(profile.join("kfx")).unwrap();
+    std::os::unix::fs::symlink(&installed, profile.join("kfx")).unwrap();
+    assert_eq!(uplift_bundle_link(&installed, &UUID).unwrap(), None);
+    assert!(std::fs::symlink_metadata(profile.join("kfx.dSYM")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_that_cannot_be_made_is_an_error_the_job_only_logs() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root writes into a read-only directory
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("release");
+    let installed = executable_at(&profile.join("deps"), "kfx-6b24f3748a65f4ab", UUID);
+    executable_at(&profile, "kfx", UUID);
+    std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = uplift_bundle_link(&installed, &UUID);
+    link_uplifted_bundle(&installed, &UUID);
+    std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let error = result.unwrap_err();
+    assert!(format!("{error:#}").contains("kfx.dSYM"), "{error:#}");
+    assert!(std::fs::symlink_metadata(profile.join("kfx.dSYM")).is_err());
+}
+
+#[test]
 fn exchanging_into_place_keeps_the_replaced_tree_at_the_staged_path() {
     let dir = tempfile::tempdir().unwrap();
     let staged = dir.path().join("staged");
@@ -1153,30 +1268,34 @@ fn a_deferred_bundle_matches_the_synchronous_one_and_resolves_lines() {
     let profile = root.join("target/debug");
     let deps = profile.join("deps");
     std::fs::create_dir_all(&deps).unwrap();
-    let Some(binary) = compile_debug_c_binary(&deps) else {
+    if compile_debug_c_binary(&deps).is_none() {
         return;
-    };
+    }
+    // Cargo's layout: `deps/<name>-<hash>`, copied up to `<profile>/<name>`.
+    let binary = deps.join("hello-0123456789abcdef");
     let prefix = format!("-Wl,-oso_prefix,{}/", profile.display());
     if relink_c_binary(&deps.join("hello.o"), &prefix, &binary).is_none() {
         return;
     }
+    let uplifted = profile.join("hello");
+    std::fs::copy(&binary, &uplifted).unwrap();
 
     let sync_staging = tempfile::tempdir().unwrap();
     let sync_tar = crate::compiler::platform::MacOsPlatform::default()
         .package_debug_bundle(&binary, sync_staging.path(), Some("unpacked"))
         .unwrap()
         .expect("the synchronous path packages a bundle");
-    let installed_bundle = deps.join("hello-bin.dSYM");
+    let installed_bundle = deps.join("hello-0123456789abcdef.dSYM");
     std::fs::remove_dir_all(&installed_bundle).unwrap();
 
     let mut config = crate::test_support::test_config(root.join("cache"));
     config.auto_gc = false;
-    let files = vec![(binary.clone(), "hello-bin".to_string())];
+    let files = vec![(binary.clone(), "hello-0123456789abcdef".to_string())];
     let env = crate::invocation::InvocationEnv::capture();
     let dsymutil = Dsymutil::from_command(&env.command("dsymutil").unwrap()).unwrap();
     let linked = LinkedExecutable {
         path: &binary,
-        store_name: "hello-bin",
+        store_name: "hello-0123456789abcdef",
         oso_root: &profile,
         sysroot: None,
         dsymutil: &dsymutil,
@@ -1215,7 +1334,7 @@ fn a_deferred_bundle_matches_the_synchronous_one_and_resolves_lines() {
     let tar = meta
         .files
         .iter()
-        .find(|file| file.name == "hello-bin.dsym.tar")
+        .find(|file| file.name == "hello-0123456789abcdef.dsym.tar")
         .expect("the bundle is part of the entry");
     assert_eq!(tar.hash, crate::cache_key::hash_file(&sync_tar).unwrap());
     assert!(
@@ -1226,7 +1345,8 @@ fn a_deferred_bundle_matches_the_synchronous_one_and_resolves_lines() {
         "the job directory is gone"
     );
 
-    // The bundle placed next to the executable resolves `main` to its line.
+    // The bundle placed next to the executable, and Cargo's link next to its
+    // uplifted copy, resolve `main` to its line.
     let symbols = Command::new("nm").arg(&binary).output().unwrap();
     let symbols = String::from_utf8_lossy(&symbols.stdout);
     let main = symbols
@@ -1234,14 +1354,22 @@ fn a_deferred_bundle_matches_the_synchronous_one_and_resolves_lines() {
         .find(|line| line.ends_with(" T _main"))
         .and_then(|line| line.split_whitespace().next())
         .expect("nm lists _main");
-    let lookup = Command::new("dwarfdump")
-        .arg(format!("--lookup=0x{main}"))
-        .arg(&installed_bundle)
-        .output()
-        .unwrap();
-    let lookup = String::from_utf8_lossy(&lookup.stdout);
-    assert!(
-        lookup.contains("hello.c") && lookup.contains("line 2"),
-        "{lookup}"
+    let uplifted_bundle = profile.join("hello.dSYM");
+    assert_eq!(
+        std::fs::read_link(&uplifted_bundle).unwrap(),
+        Path::new("deps/hello-0123456789abcdef.dSYM")
     );
+    for bundle in [&installed_bundle, &uplifted_bundle] {
+        let lookup = Command::new("dwarfdump")
+            .arg(format!("--lookup=0x{main}"))
+            .arg(bundle)
+            .output()
+            .unwrap();
+        let lookup = String::from_utf8_lossy(&lookup.stdout);
+        assert!(
+            lookup.contains("hello.c") && lookup.contains("line 2"),
+            "{}: {lookup}",
+            bundle.display()
+        );
+    }
 }
