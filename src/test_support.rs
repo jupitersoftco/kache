@@ -100,6 +100,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         daemon_publish: true,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
+        macos_debug_bundle: Default::default(),
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,

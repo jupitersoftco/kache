@@ -455,10 +455,7 @@ pub(crate) fn debug_bundle_command_for(
     let bundle_dir = env
         .resolve(bundle_dir)
         .context("debug bundle requires the invocation directory")?;
-    let output_dir = binary
-        .parent()
-        .context("debug binary has no parent directory")?;
-    let oso_root = cargo_profile_dir(output_dir).unwrap_or_else(|| output_dir.to_path_buf());
+    let oso_root = dsymutil_oso_root(&binary).context("debug binary has no parent directory")?;
     let mut command = env.command("dsymutil")?;
     command
         .current_dir(oso_root)
@@ -466,6 +463,14 @@ pub(crate) fn debug_bundle_command_for(
         .arg("-o")
         .arg(bundle_dir);
     Ok(command)
+}
+
+/// The directory `dsymutil` resolves `binary`'s relative `N_OSO` paths
+/// from: Cargo's profile directory, as the injected `-oso_prefix` strips it,
+/// or the output directory outside Cargo's layout. `None` without a parent.
+pub(crate) fn dsymutil_oso_root(binary: &Path) -> Option<PathBuf> {
+    let output_dir = binary.parent()?;
+    Some(cargo_profile_dir(output_dir).unwrap_or_else(|| output_dir.to_path_buf()))
 }
 
 /// `out_dir`'s ancestor that is Cargo's profile directory, or `None` when
@@ -1322,7 +1327,7 @@ pub(crate) mod tests {
     /// three lines of C) so the macOS leg exercises real `dsymutil` output.
     /// Returns None when the host can't run this leg: not macOS, or the
     /// compiler would not start or failed (see [`host_tool_unavailable`]).
-    fn compile_debug_c_binary(dir: &Path) -> Option<std::path::PathBuf> {
+    pub(crate) fn compile_debug_c_binary(dir: &Path) -> Option<std::path::PathBuf> {
         let cc = host_c_compiler()?;
         let source = dir.join("hello.c");
         std::fs::write(
@@ -1353,7 +1358,11 @@ pub(crate) mod tests {
 
     /// Link `object` into `binary` with the host's C compiler, adding
     /// `extra` (such as an `-oso_prefix`) when it is not empty.
-    fn relink_c_binary(object: &Path, extra: &str, binary: &Path) -> Option<std::path::PathBuf> {
+    pub(crate) fn relink_c_binary(
+        object: &Path,
+        extra: &str,
+        binary: &Path,
+    ) -> Option<std::path::PathBuf> {
         let cc = host_c_compiler()?;
         let linked = run_host_tool(|| {
             let mut command = cc.command();
@@ -1434,7 +1443,9 @@ pub(crate) mod tests {
     /// Run the command `make` builds until it succeeds or
     /// [`HOST_TOOL_ATTEMPTS`] runs out. The error names the last failure,
     /// with the tool's stderr.
-    fn run_host_tool(mut make: impl FnMut() -> Command) -> Result<std::process::Output, String> {
+    pub(crate) fn run_host_tool(
+        mut make: impl FnMut() -> Command,
+    ) -> Result<std::process::Output, String> {
         let mut last = String::new();
         for attempt in 0..HOST_TOOL_ATTEMPTS {
             if attempt > 0 {
@@ -1458,7 +1469,7 @@ pub(crate) mod tests {
     /// A host tool these tests need did not work. Locally that skips the
     /// test; in CI (`CI` set) it fails, so the macOS lane keeps real
     /// coverage instead of passing on a broken toolchain.
-    fn host_tool_unavailable<T>(what: &str, error: &str) -> Option<T> {
+    pub(crate) fn host_tool_unavailable<T>(what: &str, error: &str) -> Option<T> {
         if std::env::var_os("CI").is_some() {
             panic!("{what} failed after {HOST_TOOL_ATTEMPTS} attempts: {error}");
         }

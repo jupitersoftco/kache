@@ -6093,6 +6093,166 @@ fn wants_debug_bundle_requires_user_facing_and_debuginfo() {
 }
 
 #[test]
+fn only_an_unpacked_bundle_the_store_would_build_is_deferred() {
+    use crate::config::MacosDebugBundle::{Deferred, Sync};
+    let args = |extra: &[&str]| {
+        let mut argv = vec!["rustc", "src/main.rs", "--crate-type", "bin"];
+        argv.extend(extra);
+        rustc_args(&argv)
+    };
+    let unpacked = args(&["-g", "-Csplit-debuginfo=unpacked"]);
+    assert!(defers_debug_bundle(Deferred, "macos", &unpacked));
+    assert!(!defers_debug_bundle(Sync, "macos", &unpacked));
+    assert!(!defers_debug_bundle(Deferred, "linux", &unpacked));
+    // Packed debug info already has its bundle; rustc's default is packed.
+    assert!(!defers_debug_bundle(Deferred, "macos", &args(&["-g"])));
+    assert!(!defers_debug_bundle(
+        Deferred,
+        "macos",
+        &args(&["-g", "-Csplit-debuginfo=packed"])
+    ));
+    // No bundle at all: no debug info.
+    assert!(!defers_debug_bundle(
+        Deferred,
+        "macos",
+        &args(&["-Csplit-debuginfo=unpacked"])
+    ));
+}
+
+/// What a fake daemon was offered by `hand_off_deferred_debug_bundle`.
+#[derive(Debug, Default)]
+struct Offered {
+    cache_key: String,
+    lock_key: String,
+    unit: Option<String>,
+    stdout: String,
+    files: Vec<(PathBuf, String)>,
+    executable: PathBuf,
+    oso_root: PathBuf,
+    sysroot: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+#[test]
+fn a_deferred_bundle_is_offered_under_the_wrappers_lock_and_falls_back_otherwise() {
+    use crate::config::MacosDebugBundle;
+    use crate::debug_bundle_handoff::{EntryFields, Handoff, LinkedExecutable};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let deps = root.join("target/debug/deps");
+    std::fs::create_dir_all(&deps).unwrap();
+    let executable = deps.join("tool-1");
+    std::fs::write(&executable, b"exe").unwrap();
+    let args = rustc_args(&[
+        "rustc",
+        "src/main.rs",
+        "--crate-name",
+        "tool",
+        "--crate-type",
+        "bin",
+        "-g",
+        "-Csplit-debuginfo=unpacked",
+        "-Cmetadata=abc",
+        "--out-dir",
+        deps.to_str().unwrap(),
+    ]);
+    let result = crate::compile::CompileResult {
+        exit_code: 0,
+        signaled: false,
+        stdout: "out".to_string(),
+        stderr: String::new(),
+        pending_stderr: None,
+        artifacts: ArtifactSet::new(vec![crate::compiler::Artifact {
+            path: executable.clone(),
+            store_name: "tool-1".to_string(),
+            kind: ArtifactKind::Executable,
+            required: true,
+        }]),
+        keepalive: Vec::new(),
+    };
+    let mut config = test_config(root.join("cache"));
+    config.macos_debug_bundle = MacosDebugBundle::Deferred;
+    let store = Store::open(&config).unwrap();
+    let (width, shared) = ("w".repeat(64), "s".repeat(64));
+    let offered = std::cell::RefCell::new(None::<Offered>);
+    let offered = &offered;
+    let offer = |accept: bool| {
+        move |_: &Config,
+              fields: &EntryFields<'_>,
+              files: &[(PathBuf, String)],
+              linked: &LinkedExecutable<'_>| {
+            *offered.borrow_mut() = Some(Offered {
+                cache_key: fields.cache_key.to_string(),
+                lock_key: fields.lock_key.to_string(),
+                unit: fields.unit.map(str::to_string),
+                stdout: fields.stdout.to_string(),
+                files: files.to_vec(),
+                executable: linked.path.to_path_buf(),
+                oso_root: linked.oso_root.to_path_buf(),
+                sysroot: linked.sysroot.map(Path::to_path_buf),
+            });
+            if accept {
+                Handoff::Accepted
+            } else {
+                Handoff::Declined("refused".to_string())
+            }
+        }
+    };
+    let run = |os: &str, running: bool, accept: bool| {
+        *offered.borrow_mut() = None;
+        let hand_off = offer(accept);
+        let host = DeferralHost {
+            os,
+            daemon_running: &|_| running,
+            sysroot: &|_| Some(PathBuf::from("/toolchain")),
+            hand_off: &hand_off,
+        };
+        hand_off_deferred_debug_bundle(
+            &config,
+            &store,
+            &RustcCompiler::new(),
+            &args,
+            &result,
+            DeferredEntry {
+                cache_key: &width,
+                lock_key: &shared,
+                crate_name: "tool",
+                target: "host",
+                profile: "dev",
+                compile_time_ms: 5,
+            },
+            || {
+                Ok(PreparedRustcStoreFiles {
+                    files: vec![(executable.clone(), "tool-1".to_string())],
+                    _temporary_files: Vec::new(),
+                })
+            },
+            &host,
+        )
+    };
+
+    assert!(run("macos", true, true));
+    let seen = offered.borrow_mut().take().expect("offered");
+    assert_eq!(seen.cache_key, width);
+    assert_eq!(seen.lock_key, shared);
+    assert_eq!(seen.unit.as_deref(), Some("abc"));
+    assert_eq!(seen.stdout, "out");
+    assert_eq!(seen.files, [(executable.clone(), "tool-1".to_string())]);
+    assert_eq!(seen.executable, executable);
+    assert_eq!(seen.oso_root, root.join("target/debug"));
+    assert_eq!(seen.sysroot, Some(PathBuf::from("/toolchain")));
+
+    // A refusal leaves the store to the synchronous path.
+    assert!(!run("macos", true, false));
+    assert!(offered.borrow().is_some());
+    // No daemon, or not macOS: nothing is offered.
+    assert!(!run("macos", false, true));
+    assert!(offered.borrow().is_none());
+    assert!(!run("linux", true, true));
+    assert!(offered.borrow().is_none());
+}
+
+#[test]
 fn debug_bundle_policy_honors_split_debuginfo_and_override_order() {
     let base = ["rustc", "src/main.rs", "--crate-type", "bin", "-g"];
     for (flags, expected) in [

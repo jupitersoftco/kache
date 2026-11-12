@@ -2170,6 +2170,7 @@ mod tests {
                 out_dir_alias_root: None,
                 deferred_durability: None,
                 daemon_publish: None,
+                macos_debug_bundle: None,
                 trust_daemon_execution: None,
                 native_runtime_warmup: Some(false),
                 daemon_execution_concurrency: None,

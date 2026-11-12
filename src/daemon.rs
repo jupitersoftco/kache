@@ -1820,6 +1820,8 @@ pub(crate) struct Daemon {
     pending_uploads: Arc<RwLock<HashSet<String>>>,
     /// Finished cc compiles handed off by wrappers, waiting to be stored.
     publish_queue: crate::daemon_publish::PublishQueue,
+    /// macOS executables whose `.dSYM` is built before they are stored.
+    debug_bundle_queue: crate::debug_bundle_handoff::DebugBundleQueue,
     /// Keys with an in-flight download, each mapped to the per-key [`Notify`]
     /// that wakes waiters when the leader's [`DownloadingGuard`] drops.
     /// Claiming is an atomic insert-if-absent (see [`claim_download`]).
@@ -2382,6 +2384,7 @@ impl Daemon {
             upload_queue_closed: AtomicBool::new(false),
             pending_uploads: Arc::new(RwLock::new(HashSet::new())),
             publish_queue: crate::daemon_publish::PublishQueue::new(),
+            debug_bundle_queue: crate::debug_bundle_handoff::DebugBundleQueue::new(),
             downloading: Arc::new(RwLock::new(HashMap::new())),
             warming_tx,
             prefetched_keys: Arc::new(RwLock::new(HashSet::new())),
@@ -3037,6 +3040,10 @@ impl Daemon {
         &self.publish_queue
     }
 
+    pub(crate) fn debug_bundle_queue(&self) -> &crate::debug_bundle_handoff::DebugBundleQueue {
+        &self.debug_bundle_queue
+    }
+
     pub fn set_upload_tx(&self, tx: tokio::sync::mpsc::UnboundedSender<UploadJob>) {
         *self.upload_tx.lock().expect("upload queue mutex poisoned") = Some(tx);
         self.upload_queue_closed.store(false, Ordering::Relaxed);
@@ -3140,6 +3147,7 @@ impl Daemon {
             | Request::HashFilesWarmup(_)
             | Request::Prefetch(_)
             | Request::PublishCc(_)
+            | Request::PublishRustcDebug(_)
             | Request::PredictionFetch(_)
             | Request::PredictionPublish(_)
             | Request::Prestage(_)
@@ -7125,6 +7133,7 @@ pub(crate) async fn drain_publications_then_close_uploads(
     publish_done: tokio::sync::oneshot::Receiver<()>,
 ) {
     daemon.publish_queue().close();
+    daemon.debug_bundle_queue().close();
     let publish_progress = daemon.publish_queue().progress();
     let unpublished = crate::daemon_publish::drain_publications(
         publish_done,
@@ -7141,6 +7150,19 @@ pub(crate) async fn drain_publications_then_close_uploads(
     // an outage, so awaiting it outside that deadline would make restart
     // unbounded even though every queued job is already durable on disk.
     daemon.close_upload_queue();
+}
+
+/// Deferred debug bundles (see `debug_bundle_handoff`): job directories left
+/// by a daemon that stopped are removed before this one accepts jobs.
+fn start_debug_bundle_workers(daemon: &Arc<Daemon>) -> Result<()> {
+    let removed = crate::debug_bundle_handoff::remove_abandoned_jobs(daemon.config());
+    if removed > 0 {
+        tracing::info!("removed {removed} debug bundle jobs a previous daemon left");
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(crate::debug_bundle_handoff::QUEUE_CAPACITY);
+    daemon.debug_bundle_queue().set_sender(tx);
+    crate::debug_bundle_handoff::spawn_workers(Arc::clone(daemon), rx)
+        .context("starting the debug bundle workers")
 }
 
 async fn server_main(
@@ -7260,6 +7282,7 @@ async fn server_main(
     daemon.publish_queue().set_sender(publish_tx);
     let publish_done = crate::daemon_publish::spawn_publish_worker(daemon.clone(), publish_rx)
         .context("starting the publish worker")?;
+    start_debug_bundle_workers(&daemon)?;
 
     // Periodic GC task: run immediately on startup, then every 6 hours
     let gc_daemon = daemon.clone();
@@ -8570,6 +8593,7 @@ async fn handle_connection_started_at(
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
             Ok(Request::CompileFinished(req)) => daemon.handle_compile_finished(&req),
             Ok(Request::PublishCc(req)) => daemon.handle_publish_cc(*req).await,
+            Ok(Request::PublishRustcDebug(req)) => daemon.handle_publish_rustc_debug(*req),
             Ok(Request::PredictionFetch(req)) => daemon.handle_prediction_fetch(&req).await,
             Ok(Request::PredictionPublish(req)) => daemon.handle_prediction_publish(req),
             Ok(Request::Shutdown) => {

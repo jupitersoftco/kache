@@ -5186,6 +5186,59 @@ fn run_parsed_rustc(
         return Err(error).context("validating extra_inputs dep-info before cache commit");
     }
 
+    // `[cache] macos_debug_bundle = "deferred"`: the daemon builds the bundle
+    // below and stores the entry with it (see `debug_bundle_handoff`).
+    if lock.is_some()
+        && extra_inputs.is_none()
+        && hand_off_deferred_debug_bundle(
+            config,
+            &store,
+            compiler,
+            args,
+            &result,
+            DeferredEntry {
+                cache_key: &entry_key.key,
+                lock_key: &cache_key,
+                crate_name,
+                target,
+                profile,
+                compile_time_ms,
+            },
+            || {
+                prepare_rustc_store_files_for(
+                    &result.artifacts,
+                    depinfo_anchor.as_deref(),
+                    depinfo_working_dir,
+                    depinfo_workspace_dir,
+                    &depinfo_configured_roots,
+                    args.invocation_env().temp_dir(),
+                    crate::build_script::is_launcher_compilation(args),
+                )
+            },
+            &DeferralHost::LIVE,
+        )
+    {
+        record_input_prediction(config, Some(&store), args, record_closure, &key_outputs);
+        clean_incremental_dir(config, args);
+        let elapsed = start.elapsed().as_millis() as u64;
+        let size = result.artifacts.total_size();
+        let mut event = build_event_details(
+            config,
+            EventInputs::new(&event_root, crate_name, EventResult::Miss, elapsed)
+                .rebuilt_observed(rebuilt)
+                .compile_time_ms(compile_time_ms)
+                .size(size)
+                .keyed(&entry_key.key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
+        );
+        event.store_handed_off = true;
+        write_event(config, &event);
+        print_progress(crate_name, EventResult::Miss, elapsed, size);
+        drop(lock);
+        return Ok(result.exit_code);
+    }
+
     // Store-time debug bundle (kunobi-ninja/kache#319): a macOS `-g`
     // executable's `N_OSO` debug map points at per-build `.o` files that a
     // restoring build won't have. Unpacked debug info still has those
@@ -5303,13 +5356,7 @@ fn run_parsed_rustc(
     let trace_store = crate::phase_trace::phase("store");
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
-    let identity_compiler = args.inner_rustc.as_deref().unwrap_or(&args.rustc);
-    let rustc_version =
-        crate::cache_key::rustc_version_text_for(identity_compiler, args.invocation_env());
-    let rustc_identity = rustc_version
-        .as_deref()
-        .and_then(|version| version.lines().next())
-        .and_then(|line| line.strip_prefix("rustc "));
+    let rustc_identity = rustc_identity_for(args);
     let put = store.put_rustc_with_compile_time(
         &entry_key.key,
         crate_name,
@@ -5321,7 +5368,7 @@ fn run_parsed_rustc(
         &result.stdout,
         &result.stderr,
         compile_time_ms,
-        rustc_identity,
+        rustc_identity.as_deref(),
     );
     // A stored entry grew the store: throttled size check and a detached
     // background GC if over budget (kunobi-ninja/kache#497). A put refused for
@@ -5393,6 +5440,164 @@ fn run_parsed_rustc(
 
     drop(lock);
     Ok(result.exit_code)
+}
+
+/// The rustc release an entry records: `1.95.0 (abc 2026-01-01)` from the
+/// first line of `rustc -vV`.
+fn rustc_identity_for(args: &RustcArgs) -> Option<String> {
+    let identity_compiler = args.inner_rustc.as_deref().unwrap_or(&args.rustc);
+    let rustc_version =
+        crate::cache_key::rustc_version_text_for(identity_compiler, args.invocation_env())?;
+    rustc_version
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("rustc "))
+        .map(str::to_owned)
+}
+
+/// The fields of a deferred entry the store path has already worked out.
+struct DeferredEntry<'a> {
+    cache_key: &'a str,
+    /// The key whose lock this invocation holds: the shared key.
+    lock_key: &'a str,
+    crate_name: &'a str,
+    target: &'a str,
+    profile: &'a str,
+    compile_time_ms: u64,
+}
+
+/// Whether this compile's bundle goes to the daemon: the bundle the
+/// synchronous path would build, under `macos_debug_bundle = "deferred"`.
+fn defers_debug_bundle(
+    mode: crate::config::MacosDebugBundle,
+    host_os: &str,
+    args: &RustcArgs,
+) -> bool {
+    crate::debug_bundle_handoff::wanted(mode, host_os, args.get_codegen_opt("split-debuginfo"))
+        && wants_debug_bundle(args)
+}
+
+/// Offer the bundle and the store to the daemon. `true` when it took both;
+/// the caller then only logs. On `false` nothing was changed and the
+/// synchronous path runs: no daemon, another store volume, an output that is
+/// not a thin Mach-O, a clone that failed, or a refusal.
+#[allow(clippy::too_many_arguments)]
+fn hand_off_deferred_debug_bundle(
+    config: &Config,
+    store: &Store,
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    result: &crate::compile::CompileResult,
+    entry: DeferredEntry<'_>,
+    prepare: impl FnOnce() -> Result<PreparedRustcStoreFiles>,
+    host: &DeferralHost<'_>,
+) -> bool {
+    use crate::debug_bundle_handoff::{Dsymutil, EntryFields, Handoff, LinkedExecutable};
+    if !defers_debug_bundle(config.macos_debug_bundle, host.os, args)
+        || !volume_cache_dirs_match(store.cache_dir(), &config.cache_dir)
+        || !(host.daemon_running)(config)
+    {
+        return false;
+    }
+    let env = args.invocation_env();
+    let Some((executable, store_name)) = find_executable_output(compiler, args, &result.artifacts)
+    else {
+        return false;
+    };
+    let Some(executable) = env.resolve(&executable) else {
+        return false;
+    };
+    let Some(oso_root) = platform::dsymutil_oso_root(&executable) else {
+        return false;
+    };
+    // The program and environment the synchronous path would give dsymutil.
+    let Some(dsymutil) = env
+        .command("dsymutil")
+        .ok()
+        .and_then(|command| Dsymutil::from_command(&command))
+    else {
+        return false;
+    };
+    let sysroot = (host.sysroot)(args);
+    let prepared = match prepare() {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::debug!("not deferring the debug bundle: {error:#}");
+            return false;
+        }
+    };
+    let files: Vec<(PathBuf, String)> = prepared
+        .files
+        .iter()
+        .map(|(path, name)| {
+            (
+                env.resolve(path).unwrap_or_else(|| path.clone()),
+                name.clone(),
+            )
+        })
+        .collect();
+    let rustc_identity = rustc_identity_for(args);
+    let fields = EntryFields {
+        cache_key: entry.cache_key,
+        lock_key: entry.lock_key,
+        crate_name: entry.crate_name,
+        crate_types: &args.crate_types,
+        features: &args.features,
+        target: entry.target,
+        profile: entry.profile,
+        rustc_identity: rustc_identity.as_deref(),
+        unit: args.get_codegen_opt("metadata"),
+        stdout: &result.stdout,
+        stderr: &result.stderr,
+        compile_time_ms: entry.compile_time_ms,
+        publishes_to_remote: compiler_upload_enabled(config, true),
+    };
+    let linked = LinkedExecutable {
+        path: &executable,
+        store_name: &store_name,
+        oso_root: &oso_root,
+        sysroot: sysroot.as_deref(),
+        dsymutil: &dsymutil,
+    };
+    match (host.hand_off)(config, &fields, &files, &linked) {
+        Handoff::Accepted => true,
+        Handoff::Declined(reason) => {
+            tracing::debug!(
+                "deferred debug bundle declined for {}: {reason}",
+                entry.crate_name
+            );
+            false
+        }
+    }
+}
+
+/// What [`hand_off_deferred_debug_bundle`] asks of the host; tests supply
+/// their own.
+struct DeferralHost<'a> {
+    os: &'a str,
+    daemon_running: &'a dyn Fn(&Config) -> bool,
+    sysroot: &'a dyn Fn(&RustcArgs) -> Option<PathBuf>,
+    hand_off: &'a DeferredHandOff<'a>,
+}
+
+/// [`crate::debug_bundle_handoff::hand_off`]'s shape.
+type DeferredHandOff<'a> = dyn Fn(
+        &Config,
+        &crate::debug_bundle_handoff::EntryFields<'_>,
+        &[(PathBuf, String)],
+        &crate::debug_bundle_handoff::LinkedExecutable<'_>,
+    ) -> crate::debug_bundle_handoff::Handoff
+    + 'a;
+
+impl DeferralHost<'static> {
+    const LIVE: Self = Self {
+        os: std::env::consts::OS,
+        daemon_running: &|config| {
+            crate::daemon::existing_daemon_run_lock_is_held(&config.socket_path()).unwrap_or(false)
+        },
+        sysroot: &|args| crate::cache_key::get_rustc_sysroot_for(args, args.invocation_env()),
+        hand_off: &crate::debug_bundle_handoff::hand_off,
+    };
 }
 
 struct PreparedCcStoreFiles {
