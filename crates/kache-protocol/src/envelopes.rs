@@ -52,6 +52,10 @@ pub enum Request {
     /// of allowing an ambiguous timeout to publish and log twice.
     #[serde(rename = "publish_cc_v2")]
     PublishCc(Box<PublishCcRequest>),
+    /// A wrapper hands the daemon a macOS executable whose `.dSYM` is built
+    /// in the background before it is stored. Older daemons reject the
+    /// unknown variant and the wrapper builds the bundle itself.
+    PublishRustcDebug(Box<PublishRustcDebugRequest>),
     /// A wrapper with no local input prediction row asks for the remote's
     /// (kunobi-ninja/kache#1011). Older daemons reject the unknown variant,
     /// which the wrapper reads as no row.
@@ -260,6 +264,7 @@ impl Request {
             Request::BuildStarted(req) => req.client_version.as_deref(),
             Request::CompileStarted(req) => req.client_version.as_deref(),
             Request::PublishCc(req) => req.client_version.as_deref(),
+            Request::PublishRustcDebug(req) => req.client_version.as_deref(),
             _ => None,
         }
     }

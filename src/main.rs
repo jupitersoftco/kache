@@ -19,6 +19,7 @@ mod config_cli;
 mod config_tui;
 mod daemon;
 mod daemon_publish;
+mod debug_bundle_handoff;
 mod demand;
 mod disk_recovery;
 mod events;

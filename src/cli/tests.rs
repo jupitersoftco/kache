@@ -3893,6 +3893,7 @@ fn save_manifest_config(
         daemon_publish: false,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
+        macos_debug_bundle: Default::default(),
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,

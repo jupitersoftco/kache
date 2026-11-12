@@ -1624,6 +1624,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         disabled: false,
         cache_executables: false,
         native_runtime_warmup: true,
+        macos_debug_bundle: Default::default(),
         cache_cc_links: false,
         trust_codegen_backends: false,
         target_liveness: false,

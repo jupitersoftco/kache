@@ -6093,6 +6093,33 @@ fn wants_debug_bundle_requires_user_facing_and_debuginfo() {
 }
 
 #[test]
+fn only_an_unpacked_bundle_the_store_would_build_is_deferred() {
+    use crate::config::MacosDebugBundle::{Deferred, Sync};
+    let args = |extra: &[&str]| {
+        let mut argv = vec!["rustc", "src/main.rs", "--crate-type", "bin"];
+        argv.extend(extra);
+        rustc_args(&argv)
+    };
+    let unpacked = args(&["-g", "-Csplit-debuginfo=unpacked"]);
+    assert!(defers_debug_bundle(Deferred, "macos", &unpacked));
+    assert!(!defers_debug_bundle(Sync, "macos", &unpacked));
+    assert!(!defers_debug_bundle(Deferred, "linux", &unpacked));
+    // Packed debug info already has its bundle; rustc's default is packed.
+    assert!(!defers_debug_bundle(Deferred, "macos", &args(&["-g"])));
+    assert!(!defers_debug_bundle(
+        Deferred,
+        "macos",
+        &args(&["-g", "-Csplit-debuginfo=packed"])
+    ));
+    // No bundle at all: no debug info.
+    assert!(!defers_debug_bundle(
+        Deferred,
+        "macos",
+        &args(&["-Csplit-debuginfo=unpacked"])
+    ));
+}
+
+#[test]
 fn debug_bundle_policy_honors_split_debuginfo_and_override_order() {
     let base = ["rustc", "src/main.rs", "--crate-type", "bin", "-g"];
     for (flags, expected) in [

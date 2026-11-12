@@ -493,18 +493,28 @@ fn discard_handoff_files(request: &PublishCcRequest) {
 /// Queue the entry for upload the way the wrapper would have: a durable
 /// intent first, then the daemon's own upload pipeline.
 fn enqueue_upload(daemon: &Arc<Daemon>, config: &Config, request: &PublishCcRequest) {
+    enqueue_entry_upload(daemon, config, &request.cache_key, &request.crate_name);
+}
+
+/// [`enqueue_upload`] for any entry the daemon stored itself.
+pub(crate) fn enqueue_entry_upload(
+    daemon: &Arc<Daemon>,
+    config: &Config,
+    cache_key: &str,
+    crate_name: &str,
+) {
     if config.remote_readonly {
         daemon.warn_readonly_upload_skipped();
         return;
     }
     let job = UploadJob {
-        key: request.cache_key.clone(),
+        key: cache_key.to_owned(),
         entry_dir: config
             .store_dir()
-            .join(&request.cache_key)
+            .join(cache_key)
             .to_string_lossy()
             .into_owned(),
-        crate_name: request.crate_name.clone(),
+        crate_name: crate_name.to_owned(),
         client_epoch: 0,
         client_version: Some(crate::VERSION.to_owned()),
     };
@@ -512,7 +522,7 @@ fn enqueue_upload(daemon: &Arc<Daemon>, config: &Config, request: &PublishCcRequ
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let response = handle.block_on(daemon.handle_upload(&job));
         if let Some(error) = response.error {
-            tracing::debug!("upload of {} not queued: {error}", request.crate_name);
+            tracing::debug!("upload of {crate_name} not queued: {error}");
         }
     }
 }
@@ -846,7 +856,7 @@ pub(crate) fn sweep_orphaned_handoffs(config: &Config, grace: Duration) -> Hando
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_request = entry.file_name().to_string_lossy().starts_with("cc-")
+        let is_request = is_request_dir_name(&entry.file_name().to_string_lossy())
             && std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
         if !is_request {
             continue;
@@ -860,6 +870,12 @@ pub(crate) fn sweep_orphaned_handoffs(config: &Config, grace: Duration) -> Hando
         }
     }
     sweep
+}
+
+/// A cc request (`cc-`), or a deferred debug bundle's staging or job
+/// directory (`dsym-`, see `debug_bundle_handoff`).
+fn is_request_dir_name(name: &str) -> bool {
+    name.starts_with("cc-") || name.starts_with(crate::debug_bundle_handoff::DIR_PREFIX)
 }
 
 pub(crate) fn remove_handoff_files(files: &[HandoffFile]) {
@@ -963,6 +979,15 @@ mod tests {
 
         assert_eq!(sweep.removed, 0);
         assert!(outside.join("precious").exists());
+    }
+
+    #[test]
+    fn cc_requests_and_debug_bundle_directories_are_swept() {
+        assert!(is_request_dir_name("cc-abc"));
+        assert!(is_request_dir_name("dsym-stage-abc"));
+        assert!(is_request_dir_name("dsym-job-abc"));
+        assert!(!is_request_dir_name("keep-me"));
+        assert!(!is_request_dir_name("xcc-abc"));
     }
 
     #[test]
