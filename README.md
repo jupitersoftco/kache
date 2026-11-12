@@ -1,3 +1,20 @@
+> [!NOTE]
+> **This is an unofficial fork of [kunobi-ninja/kache](https://github.com/kunobi-ninja/kache), based on v2.1.1.
+> It is not affiliated with or endorsed by Kunobi.** Use upstream unless you need the change below.
+>
+> **Why the fork exists:** on macOS, Kache stores each linked executable with a relocatable `.dSYM`.
+> Upstream builds that bundle (`dsymutil` plus a tar) synchronously, before rustc returns to Cargo.
+> For a large test harness that adds about 10 s to every edit-and-rebuild.
+> This fork adds `cache.macos_debug_bundle = "deferred"` (env `KACHE_MACOS_DEBUG_BUNDLE`).
+> With it, the daemon builds and stores the bundle in the background after the build returns.
+> Cache keys and stored entries are the same as with the default `"sync"`.
+> Until the daemon installs the bundle (usually well under a second; longer for very large binaries), a freshly
+> linked executable's backtraces and lldb sessions have no file:line information.
+> The default stays `"sync"`, so behavior is unchanged unless you opt in.
+> The change is on the `deferred-debug-bundle` branch and in the commit history.
+> All other code is upstream's, under the same Apache-2.0 license (see `LICENSE`).
+> It may be offered upstream after wider validation.
+
 [![CI](https://github.com/kunobi-ninja/kache/actions/workflows/ci.yml/badge.svg)](https://github.com/kunobi-ninja/kache/actions/workflows/ci.yml)
 [![Bench](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml/badge.svg)](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml)
 [![Crates.io](https://img.shields.io/crates/v/kache.svg)](https://crates.io/crates/kache)
