@@ -6130,11 +6130,20 @@ struct Offered {
     executable: PathBuf,
     oso_root: PathBuf,
     sysroot: Option<PathBuf>,
+    event: Option<BuildEvent>,
+}
+
+#[test]
+fn a_declined_deferral_is_recorded_as_a_skip_with_its_reason() {
+    assert_eq!(
+        deferral_skip_reason("debug bundle refused: queue full"),
+        "debug-bundle-deferral: debug bundle refused: queue full"
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn a_deferred_bundle_is_offered_under_the_wrappers_lock_and_falls_back_otherwise() {
+fn a_deferred_bundle_is_offered_under_the_wrappers_lock_and_never_falls_back_to_sync() {
     use crate::config::MacosDebugBundle;
     use crate::debug_bundle_handoff::{EntryFields, Handoff, LinkedExecutable};
     let dir = tempfile::tempdir().unwrap();
@@ -6190,6 +6199,7 @@ fn a_deferred_bundle_is_offered_under_the_wrappers_lock_and_falls_back_otherwise
                 executable: linked.path.to_path_buf(),
                 oso_root: linked.oso_root.to_path_buf(),
                 sysroot: linked.sysroot.map(Path::to_path_buf),
+                event: fields.event.cloned(),
             });
             if accept {
                 Handoff::Accepted
@@ -6198,7 +6208,14 @@ fn a_deferred_bundle_is_offered_under_the_wrappers_lock_and_falls_back_otherwise
             }
         }
     };
-    let run = |os: &str, running: bool, accept: bool| {
+    let other_volume = Store::open(&test_config(root.join("shard"))).unwrap();
+    let events_built = std::cell::Cell::new(0);
+    let run_with = |os: &str,
+                    running: bool,
+                    accept: bool,
+                    store: &Store,
+                    result: &crate::compile::CompileResult,
+                    staged: bool| {
         *offered.borrow_mut() = None;
         let hand_off = offer(accept);
         let host = DeferralHost {
@@ -6209,10 +6226,10 @@ fn a_deferred_bundle_is_offered_under_the_wrappers_lock_and_falls_back_otherwise
         };
         hand_off_deferred_debug_bundle(
             &config,
-            &store,
+            store,
             &RustcCompiler::new(),
             &args,
-            &result,
+            result,
             DeferredEntry {
                 cache_key: &width,
                 lock_key: &shared,
@@ -6222,16 +6239,26 @@ fn a_deferred_bundle_is_offered_under_the_wrappers_lock_and_falls_back_otherwise
                 compile_time_ms: 5,
             },
             || {
+                if !staged {
+                    anyhow::bail!("dep-info would not normalize");
+                }
                 Ok(PreparedRustcStoreFiles {
                     files: vec![(executable.clone(), "tool-1".to_string())],
                     _temporary_files: Vec::new(),
                 })
             },
+            || {
+                events_built.set(events_built.get() + 1);
+                BuildEvent::new_for_test("tool", EventResult::Miss)
+            },
             &host,
         )
     };
+    let run = |os: &str, running: bool, accept: bool| {
+        run_with(os, running, accept, &store, &result, true)
+    };
 
-    assert!(run("macos", true, true));
+    assert_eq!(run("macos", true, true), Deferral::Accepted);
     let seen = offered.borrow_mut().take().expect("offered");
     assert_eq!(seen.cache_key, width);
     assert_eq!(seen.lock_key, shared);
@@ -6241,15 +6268,58 @@ fn a_deferred_bundle_is_offered_under_the_wrappers_lock_and_falls_back_otherwise
     assert_eq!(seen.executable, executable);
     assert_eq!(seen.oso_root, root.join("target/debug"));
     assert_eq!(seen.sysroot, Some(PathBuf::from("/toolchain")));
+    // The daemon writes the compile's event, marked as handed off.
+    let event = seen.event.expect("the event travels with the job");
+    assert_eq!(event.crate_name, "tool");
+    assert!(event.store_handed_off);
+    assert_eq!(events_built.get(), 1);
 
-    // A refusal leaves the store to the synchronous path.
-    assert!(!run("macos", true, false));
+    // A refusal (a full queue, say) declines: the caller stores nothing and
+    // runs no dsymutil of its own.
+    assert_eq!(
+        run("macos", true, false),
+        Deferral::Declined("refused".to_string())
+    );
     assert!(offered.borrow().is_some());
-    // No daemon, or not macOS: nothing is offered.
-    assert!(!run("macos", false, true));
+    // So does every other reason the daemon cannot take the bundle, before
+    // anything is offered.
+    assert_eq!(
+        run("macos", false, true),
+        Deferral::Declined("no daemon is running".to_string())
+    );
     assert!(offered.borrow().is_none());
-    assert!(!run("linux", true, true));
+    assert_eq!(
+        run_with("macos", true, true, &other_volume, &result, true),
+        Deferral::Declined("the store is a volume shard".to_string())
+    );
     assert!(offered.borrow().is_none());
+    let unstaged = run_with("macos", true, true, &store, &result, false);
+    assert!(
+        matches!(&unstaged, Deferral::Declined(reason)
+            if reason == "staging the outputs failed: dep-info would not normalize"),
+        "{unstaged:?}"
+    );
+    assert!(offered.borrow().is_none());
+    // Nothing to defer: not macOS, or no executable among the outputs. The
+    // usual store path runs, and no event is built for a daemon.
+    let built = events_built.get();
+    assert_eq!(run("linux", true, true), Deferral::NotWanted);
+    assert!(offered.borrow().is_none());
+    let no_executable = crate::compile::CompileResult {
+        exit_code: 0,
+        signaled: false,
+        stdout: String::new(),
+        stderr: String::new(),
+        pending_stderr: None,
+        artifacts: ArtifactSet::new(Vec::new()),
+        keepalive: Vec::new(),
+    };
+    assert_eq!(
+        run_with("macos", true, true, &store, &no_executable, true),
+        Deferral::NotWanted
+    );
+    assert!(offered.borrow().is_none());
+    assert_eq!(events_built.get(), built);
 }
 
 #[test]
