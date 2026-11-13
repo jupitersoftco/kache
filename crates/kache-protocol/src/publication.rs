@@ -117,6 +117,11 @@ pub struct PublishRustcDebugRequest {
     /// it, and the build's whole environment to run it in.
     pub dsymutil: String,
     pub dsymutil_env: Vec<(String, String)>,
+    /// The compile's build event, which the daemon writes when the job ends,
+    /// with a store error when nothing was stored. `None` from a wrapper that
+    /// wrote its own event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<BuildEvent>,
 }
 
 #[cfg(test)]
@@ -148,12 +153,15 @@ mod tests {
             uuid: "0".repeat(32),
             dsymutil: "/usr/bin/dsymutil".to_string(),
             dsymutil_env: vec![("DEVELOPER_DIR".to_string(), "/x".to_string())],
+            event: None,
         };
         let envelope = crate::Request::PublishRustcDebug(Box::new(request));
         assert_eq!(envelope.client_version(), Some("9.9.9"));
         assert!(envelope.is_build_activity());
         let json = serde_json::to_value(&envelope).unwrap();
         assert!(json.get("publish_rustc_debug").is_some(), "{json}");
+        // A request without an event is the one an older wrapper sends.
+        assert!(json["publish_rustc_debug"].get("event").is_none(), "{json}");
         let back: crate::Request = serde_json::from_value(json).unwrap();
         assert_eq!(back, envelope);
     }

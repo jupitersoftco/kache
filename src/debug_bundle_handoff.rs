@@ -12,13 +12,16 @@
 //!   directory. The clones share blocks with the originals, so they are cheap,
 //!   and they keep the link-time bytes when the next build rewrites the
 //!   originals in place. A clone that cannot be made (another volume, a
-//!   missing object) declines the deferral; the wrapper then runs `dsymutil`
-//!   itself, as `sync` does.
+//!   missing object) declines the deferral.
+//! - A deferral that is declined for any reason (a full queue, no daemon, a
+//!   clone that failed) does not run `dsymutil` on the build's critical path:
+//!   the wrapper leaves rustc's outputs as they are and stores nothing for
+//!   this compile. Only `sync` runs `dsymutil` in the wrapper.
 //! - The wrapper sends [`PublishRustcDebugRequest`]. The daemon accepts by
 //!   renaming the staging directory into a job directory; a wrapper whose
 //!   wait ran out withdraws by renaming it first. Exactly one rename wins, so
 //!   exactly one side owns the work.
-//! - A daemon worker runs `dsymutil` at background priority from the job's
+//! - A daemon worker runs `dsymutil` at utility priority from the job's
 //!   `objects/` directory, the same relative layout the synchronous path
 //!   reads from Cargo's profile directory. It points the bundle's recorded
 //!   executable path back at the build's executable, places a copy of the
@@ -26,9 +29,13 @@
 //!   (same `LC_UUID`), tars the bundle as `sync` does, and stores executable,
 //!   other files and tar in one put. Restores see the same entry either way.
 //! - Until that put the key has no entry: a build that needs it meanwhile
-//!   misses and compiles. A bundle that fails is never replaced by an entry
-//!   without one. Jobs are not persisted: a daemon that stops drops them, and
-//!   the next daemon removes their directories before it accepts work.
+//!   misses and compiles. A bundle that fails, or runs past a time limit that
+//!   grows with the job's inputs, stores nothing: no executable is stored
+//!   without its bundle. The daemon writes the compile's event once the job
+//!   ends, with the reason in its store error when nothing was stored, so
+//!   `kache stats` and `kache explain` show it. Jobs are not persisted: a
+//!   daemon that stops drops them, and the next daemon removes their
+//!   directories before it accepts work.
 
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -67,7 +74,7 @@ const OUTPUT_DIR: &str = "out";
 /// Jobs at once. Each runs `dsymutil` with [`DSYMUTIL_THREADS`].
 pub(crate) const WORKERS: usize = 2;
 /// Accepted jobs waiting for a worker. A full queue declines, and that
-/// wrapper builds its bundle itself.
+/// wrapper does not store its executable.
 pub(crate) const QUEUE_CAPACITY: usize = 8;
 const DSYMUTIL_THREADS: &str = "2";
 /// How long a wrapper waits for the daemon to accept. Acceptance is a rename;
@@ -75,9 +82,14 @@ const DSYMUTIL_THREADS: &str = "2";
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a finished job waits for a peer that holds the key.
 const PEER_WAIT: Duration = Duration::from_secs(30);
-/// How long one `dsymutil` may run before it is killed, so a hung run cannot
-/// hold a worker. The executable is then stored without a bundle.
-const DSYMUTIL_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long one `dsymutil` may run at least before it is killed, so a hung
+/// run cannot hold a worker forever. Nothing is stored then. See
+/// [`dsymutil_timeout`].
+const DSYMUTIL_TIMEOUT_FLOOR: Duration = Duration::from_secs(600);
+/// What [`dsymutil_timeout`] adds per MiB of the job's inputs. A 276 MB
+/// executable with 4.1 GiB of objects took 217 s at utility priority with
+/// two threads, about 50 ms per MiB; this allows five times that.
+const DSYMUTIL_TIMEOUT_PER_MIB: Duration = Duration::from_millis(250);
 /// Age after which a sibling `.<name>.dSYM.kache-*` directory is taken to be
 /// one a stopped daemon left behind mid-install.
 const INSTALL_LEFTOVER_AGE: Duration = Duration::from_secs(3600);
@@ -114,6 +126,8 @@ pub(crate) struct EntryFields<'a> {
     pub(crate) stderr: &'a str,
     pub(crate) compile_time_ms: u64,
     pub(crate) publishes_to_remote: bool,
+    /// The compile's event, for the daemon to write when the job ends.
+    pub(crate) event: Option<&'a crate::events::BuildEvent>,
 }
 
 /// The executable a deferred bundle is built from.
@@ -162,7 +176,7 @@ impl Dsymutil {
 pub(crate) enum Handoff {
     /// The daemon owns the job, the staging directory and the store.
     Accepted,
-    /// The wrapper stores as before; `reason` is for the debug log.
+    /// The wrapper stores nothing for this compile; `reason` says why.
     Declined(String),
 }
 
@@ -392,6 +406,7 @@ fn request_for(
         uuid: uuid_hex(&capture.uuid),
         dsymutil: executable.dsymutil.program.clone(),
         dsymutil_env: executable.dsymutil.env.clone(),
+        event: entry.event.cloned(),
     }
 }
 
@@ -629,21 +644,48 @@ fn run_worker(
     while let Some(job) = rx.lock().ok().and_then(|mut rx| rx.blocking_recv()) {
         match &store {
             Ok(store) => {
-                process_job(
-                    daemon,
-                    &config,
-                    store,
-                    job,
-                    &dsymutil_command,
-                    DSYMUTIL_TIMEOUT,
-                );
+                let timeout = dsymutil_timeout(job_input_bytes(&job.dir));
+                process_job(daemon, &config, store, job, &dsymutil_command, timeout);
             }
             Err(error) => {
                 let _cleanup = StagingGuard(Some(job.dir));
-                tracing::warn!("debug bundle worker has no store: {error:#}");
+                let reason = format!("debug bundle worker has no store: {error:#}");
+                tracing::warn!("{reason}");
+                write_job_event(&config, job.request.event, &reason, Duration::ZERO);
             }
         }
     }
+}
+
+/// How long the `dsymutil` of a job with `input_bytes` of inputs may run:
+/// [`DSYMUTIL_TIMEOUT_FLOOR`] plus [`DSYMUTIL_TIMEOUT_PER_MIB`] per MiB. A
+/// fixed limit killed legitimate runs on 250 MB executables whose objects
+/// add gigabytes; the limit is there for a hung run, not a slow one.
+fn dsymutil_timeout(input_bytes: u64) -> Duration {
+    let mib = u32::try_from(input_bytes >> 20).unwrap_or(u32::MAX);
+    DSYMUTIL_TIMEOUT_FLOOR.saturating_add(DSYMUTIL_TIMEOUT_PER_MIB.saturating_mul(mib))
+}
+
+/// Bytes of the files `dsymutil` reads from the job directory: the
+/// executable and the objects. Toolchain rlibs, read in place, are not
+/// counted. Unreadable entries count as empty.
+fn job_input_bytes(dir: &Path) -> u64 {
+    tree_bytes(&dir.join(EXECUTABLE_DIR)).saturating_add(tree_bytes(&dir.join(OBJECTS_DIR)))
+}
+
+fn tree_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    std::fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .flatten()
+            .map(|entry| tree_bytes(&entry.path()))
+            .fold(0, u64::saturating_add)
+    })
 }
 
 /// Builds the `dsymutil` command for a job: the request, then the staged
@@ -655,19 +697,32 @@ type DsymutilCommand = dyn Fn(&PublishRustcDebugRequest, &Path, &Path, &Path) ->
 enum JobOutcome {
     /// Executable and bundle are stored as one entry.
     Stored,
-    /// The bundle failed and the executable is stored without one, as the
-    /// synchronous path does.
-    StoredWithoutBundle,
     /// A peer stored the key first.
     PeerStored,
+    /// `dsymutil` failed or ran out of time; nothing is stored, so no
+    /// executable is ever stored without its bundle.
+    BundleFailed(String),
     /// The put failed; nothing is stored.
-    Failed,
+    Failed(String),
     /// The daemon is stopping; nothing is stored.
     Dropped,
 }
 
-/// Run one job to its end. Its directory is gone afterwards, whatever the
-/// outcome.
+impl JobOutcome {
+    /// Why nothing was stored, for the compile's event; empty when the key
+    /// is stored.
+    fn store_error(&self) -> String {
+        match self {
+            Self::Stored | Self::PeerStored => String::new(),
+            Self::BundleFailed(error) => format!("deferred debug bundle failed: {error}"),
+            Self::Failed(error) => error.clone(),
+            Self::Dropped => "the daemon stopped before the deferred debug bundle was built".into(),
+        }
+    }
+}
+
+/// Run one job to its end and write the compile's event. Its directory is
+/// gone afterwards, whatever the outcome.
 fn process_job(
     daemon: &Arc<Daemon>,
     config: &Config,
@@ -677,12 +732,42 @@ fn process_job(
     timeout: Duration,
 ) -> JobOutcome {
     let _cleanup = StagingGuard(Some(job.dir.clone()));
+    let started = std::time::Instant::now();
+    let outcome = run_job(daemon, config, store, &job, dsymutil, timeout);
+    write_job_event(
+        config,
+        job.request.event,
+        &outcome.store_error(),
+        started.elapsed(),
+    );
+    outcome
+}
+
+fn run_job(
+    daemon: &Arc<Daemon>,
+    config: &Config,
+    store: &Store,
+    job: &DebugBundleJob,
+    dsymutil: &DsymutilCommand,
+    timeout: Duration,
+) -> JobOutcome {
     let crate_name = &job.request.crate_name;
     let started = std::time::Instant::now();
     if daemon.debug_bundle_queue().is_closing() {
         return JobOutcome::Dropped;
     }
-    let (files, bundled) = entry_files(&job, dsymutil, timeout);
+    let files = match entry_files(job, dsymutil, timeout) {
+        Ok(files) => files,
+        Err(error) => {
+            let error = crate::wrapper::store_error_for_event(&error);
+            tracing::warn!(
+                "deferred debug bundle for {crate_name} failed after {} ms; not caching it: \
+                 {error}",
+                started.elapsed().as_millis()
+            );
+            return JobOutcome::BundleFailed(error);
+        }
+    };
     if daemon.debug_bundle_queue().is_closing() {
         return JobOutcome::Dropped;
     }
@@ -699,58 +784,59 @@ fn process_job(
                 );
             }
             tracing::info!(
-                "stored {crate_name} {} its deferred debug bundle after {} ms",
-                if bundled { "with" } else { "without" },
+                "stored {crate_name} with its deferred debug bundle after {} ms",
                 started.elapsed().as_millis()
             );
-            if bundled {
-                JobOutcome::Stored
-            } else {
-                JobOutcome::StoredWithoutBundle
-            }
+            JobOutcome::Stored
         }
         Ok(false) => {
             tracing::debug!("{crate_name}: a peer stored the key first");
             JobOutcome::PeerStored
         }
         Err(error) => {
+            let error = crate::wrapper::store_error_for_event(&error);
             tracing::warn!(
-                "could not store {crate_name} from its deferred debug bundle job: {}",
-                crate::wrapper::store_error_for_event(&error)
+                "could not store {crate_name} from its deferred debug bundle job: {error}"
             );
-            JobOutcome::Failed
+            JobOutcome::Failed(error)
         }
     }
 }
 
-/// The entry's files, `(absolute path, store name)`, with the bundle tar when
-/// the bundle could be built, and whether it could. A bundle that fails
-/// leaves the executable to be stored without one, with a warning: what the
-/// synchronous path does.
+/// Write the compile's event the wrapper handed over, if it did, with
+/// `store_error` (empty when the key is stored) and the job's time.
+fn write_job_event(
+    config: &Config,
+    event: Option<crate::events::BuildEvent>,
+    store_error: &str,
+    elapsed: Duration,
+) {
+    let Some(mut event) = event else {
+        return;
+    };
+    event.store_error = store_error.to_owned();
+    event.daemon_store_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    event.store_handed_off = true;
+    crate::wrapper::write_event(config, &event);
+}
+
+/// The entry's files, `(absolute path, store name)`, the bundle tar among
+/// them. An error when the bundle could not be built: the job then stores
+/// nothing.
 fn entry_files(
     job: &DebugBundleJob,
     dsymutil: &DsymutilCommand,
     timeout: Duration,
-) -> (Vec<(PathBuf, String)>, bool) {
+) -> Result<Vec<(PathBuf, String)>> {
     let mut files: Vec<(PathBuf, String)> = job
         .request
         .files
         .iter()
         .map(|file| (job.dir.join(&file.path), file.store_name.clone()))
         .collect();
-    match build_bundle(job, dsymutil, timeout) {
-        Ok(tar) => {
-            files.push((tar, job.request.bundle_store_name.clone()));
-            (files, true)
-        }
-        Err(error) => {
-            tracing::warn!(
-                "deferred debug bundle for {} failed, caching it without one: {error:#}",
-                job.request.crate_name
-            );
-            (files, false)
-        }
-    }
+    let tar = build_bundle(job, dsymutil, timeout)?;
+    files.push((tar, job.request.bundle_store_name.clone()));
+    Ok(files)
 }
 
 /// Run `dsymutil`, place the bundle next to the build's executable, and tar
@@ -835,8 +921,10 @@ fn run_bounded(mut command: Command, log: &Path, timeout: Duration) -> Result<()
 
 /// The command the synchronous path runs (`dsymutil <executable> -o
 /// <bundle>`, the build's program and environment), from `objects`, the
-/// mirror of the `-oso_prefix` root. Adds `-j 2` and clamps it to background
-/// priority where macOS offers `taskpolicy`.
+/// mirror of the `-oso_prefix` root. Adds `-j 2` and clamps it to utility
+/// priority where macOS offers `taskpolicy`. Background priority throttled
+/// a 276 MB executable's run from 217 s at utility to 673 s while builds
+/// kept the machine busy, past the old fixed ten-minute limit.
 fn dsymutil_command(
     request: &PublishRustcDebugRequest,
     executable: &Path,
@@ -846,7 +934,7 @@ fn dsymutil_command(
     const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
     let mut command = if Path::new(TASKPOLICY).exists() {
         let mut command = Command::new(TASKPOLICY);
-        command.args(["-c", "background"]).arg(&request.dsymutil);
+        command.args(["-c", "utility"]).arg(&request.dsymutil);
         command
     } else {
         Command::new(&request.dsymutil)
@@ -1248,8 +1336,8 @@ fn claim(
     Ok(Some(lock))
 }
 
-/// Utility priority for the worker's own tar and store work; `dsymutil` is
-/// clamped further by [`dsymutil_command`].
+/// Utility priority for the worker's own tar and store work, as for the
+/// `dsymutil` [`dsymutil_command`] starts.
 #[cfg(target_os = "macos")]
 fn lower_thread_priority() {
     const QOS_CLASS_UTILITY: libc::c_uint = 0x11;
