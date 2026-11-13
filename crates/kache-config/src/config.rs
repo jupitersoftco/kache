@@ -566,7 +566,8 @@ pub struct Config {
     /// When a cached macOS executable with unpacked debug info gets its
     /// `.dSYM` bundle: `sync` (default) runs `dsymutil` before the wrapper
     /// returns; `deferred` hands it to a running daemon together with the
-    /// store. `KACHE_MACOS_DEBUG_BUNDLE` or `[cache] macos_debug_bundle`.
+    /// store, and stores nothing when the daemon cannot take it.
+    /// `KACHE_MACOS_DEBUG_BUNDLE` or `[cache] macos_debug_bundle`.
     pub macos_debug_bundle: MacosDebugBundle,
     /// Prepare cold MSVC runtime hashes in the daemon while native units compile.
     /// The first units may run without caching. Disable with
@@ -5434,7 +5435,8 @@ pub enum MacosDebugBundle {
     Sync,
     /// A running daemon runs `dsymutil` from link-time clones of the
     /// executable and its objects, then stores executable and bundle as one
-    /// entry. Without a daemon that accepts the job the wrapper runs `sync`.
+    /// entry. Without a daemon that accepts the job, the executable is not
+    /// stored by that compile; `dsymutil` never runs in the wrapper.
     Deferred,
 }
 

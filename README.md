@@ -10,6 +10,10 @@
 > Cache keys and stored entries are the same as with the default `"sync"`.
 > Until the daemon installs the bundle (usually well under a second; longer for very large binaries), a freshly
 > linked executable's backtraces and lldb sessions have no file:line information.
+> If the daemon cannot take the bundle (for example its queue is full) or `dsymutil` fails, that executable is
+> simply not cached: no `dsymutil` runs on Cargo's critical path, and no executable is stored without its bundle.
+> Such an executable gets no `.dSYM` until its next link. Its debug map is relative to Cargo's profile directory
+> (Kache links with `-oso_prefix`), so lldb resolves its file:line only when started from that directory.
 > The default stays `"sync"`, so behavior is unchanged unless you opt in.
 > The change is on the `deferred-debug-bundle` branch and in the commit history.
 > All other code is upstream's, under the same Apache-2.0 license (see `LICENSE`).

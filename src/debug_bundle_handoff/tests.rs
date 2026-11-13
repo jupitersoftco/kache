@@ -417,6 +417,7 @@ fn request(config: &Config, staging: &Path) -> PublishRustcDebugRequest {
         uuid: uuid_hex(&UUID),
         dsymutil: "dsymutil".to_string(),
         dsymutil_env: vec![("DEVELOPER_DIR".to_string(), "/xcode".to_string())],
+        event: None,
     }
 }
 
@@ -966,6 +967,7 @@ fn entry_fields(cache_key: &str) -> EntryFields<'_> {
         stderr: "",
         compile_time_ms: 9,
         publishes_to_remote: false,
+        event: None,
     }
 }
 
@@ -1013,7 +1015,7 @@ fn the_daemon_runs_the_builds_dsymutil_in_the_builds_environment() {
     assert!(args.ends_with(&tail.map(String::from)), "{args:?}");
     let program = command.get_program().to_string_lossy().into_owned();
     if program == "/usr/sbin/taskpolicy" {
-        assert_eq!(args[..3], ["-c", "background", "/opt/xcode/dsymutil"]);
+        assert_eq!(args[..3], ["-c", "utility", "/opt/xcode/dsymutil"]);
         assert_eq!(args.len(), 3 + tail.len());
     } else {
         assert_eq!(program, "/opt/xcode/dsymutil");
@@ -1039,8 +1041,7 @@ fn a_job_builds_installs_and_tars_the_bundle() {
     // The build rewrites its object after the wrapper returned.
     std::fs::write(fixture.profile.join("deps/a.o"), b"next build").unwrap();
 
-    let (files, bundled) = entry_files(&job, &fake_dsymutil, NO_TIMEOUT);
-    assert!(bundled);
+    let files = entry_files(&job, &fake_dsymutil, NO_TIMEOUT).unwrap();
     let names: Vec<_> = files.iter().map(|(_, name)| name.as_str()).collect();
     assert_eq!(names, ["demo-1234", "demo-1234.d", "demo-1234.dsym.tar"]);
     assert!(files.iter().all(|(path, _)| path.starts_with(&job.dir)));
@@ -1088,17 +1089,101 @@ fn a_job_builds_installs_and_tars_the_bundle() {
 
 #[cfg(unix)]
 #[test]
-fn a_failed_dsymutil_leaves_the_entry_without_a_bundle() {
+fn a_failed_dsymutil_leaves_no_entry_files() {
     let fixture = make_fixture(OBJECTS);
     let config = fixture_config(&fixture);
     let job = accepted_job(&fixture, &config);
     let error = build_bundle(&job, &failing_dsymutil, NO_TIMEOUT).unwrap_err();
     assert!(format!("{error:#}").contains("cannot read"), "{error:#}");
-    let (files, bundled) = entry_files(&job, &failing_dsymutil, NO_TIMEOUT);
-    assert!(!bundled);
-    let names: Vec<_> = files.iter().map(|(_, name)| name.as_str()).collect();
-    assert_eq!(names, ["demo-1234", "demo-1234.d"]);
+    let error = entry_files(&job, &failing_dsymutil, NO_TIMEOUT).unwrap_err();
+    assert!(format!("{error:#}").contains("cannot read"), "{error:#}");
     assert!(!fixture.profile.join("deps/demo-1234.dSYM").exists());
+}
+
+#[test]
+fn the_dsymutil_limit_grows_with_the_jobs_inputs() {
+    // Ten minutes for anything under a MiB, then a quarter second per MiB.
+    assert_eq!(dsymutil_timeout(0), Duration::from_secs(600));
+    assert_eq!(dsymutil_timeout((1 << 20) - 1), Duration::from_secs(600));
+    assert_eq!(dsymutil_timeout(1 << 20), Duration::from_millis(600_250));
+    // A 250 MiB executable with 3 GiB of objects: 3322 MiB.
+    assert_eq!(
+        dsymutil_timeout((250 << 20) + (3 << 30)),
+        Duration::from_millis(1_430_500)
+    );
+    // No overflow, however large.
+    assert!(dsymutil_timeout(u64::MAX) > Duration::from_secs(1 << 29));
+}
+
+#[test]
+fn a_jobs_inputs_are_its_executable_and_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let job = dir.path();
+    std::fs::create_dir_all(job.join("bin")).unwrap();
+    std::fs::create_dir_all(job.join("objects/deps/nested")).unwrap();
+    std::fs::create_dir_all(job.join("files")).unwrap();
+    std::fs::write(job.join("bin/demo"), [0; 3]).unwrap();
+    std::fs::write(job.join("objects/deps/a.o"), [0; 5]).unwrap();
+    std::fs::write(job.join("objects/deps/nested/b.o"), [0; 7]).unwrap();
+    // The entry's other files are not dsymutil's input.
+    std::fs::write(job.join("files/0-demo.d"), [0; 100]).unwrap();
+    assert_eq!(job_input_bytes(job), 15);
+    assert_eq!(tree_bytes(&job.join("objects/deps/a.o")), 5);
+    assert_eq!(job_input_bytes(&job.join("missing")), 0);
+}
+
+#[test]
+fn only_a_job_that_stored_nothing_reports_a_store_error() {
+    assert_eq!(JobOutcome::Stored.store_error(), "");
+    assert_eq!(JobOutcome::PeerStored.store_error(), "");
+    assert_eq!(
+        JobOutcome::BundleFailed("dsymutil was killed".into()).store_error(),
+        "deferred debug bundle failed: dsymutil was killed"
+    );
+    assert_eq!(
+        JobOutcome::Failed("disk full".into()).store_error(),
+        "disk full"
+    );
+    assert_eq!(
+        JobOutcome::Dropped.store_error(),
+        "the daemon stopped before the deferred debug bundle was built"
+    );
+}
+
+/// The events `config`'s event log holds.
+fn logged_events(config: &Config) -> Vec<crate::events::BuildEvent> {
+    std::fs::read_to_string(config.event_log_path())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+#[test]
+fn the_daemon_writes_the_event_a_wrapper_handed_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    std::fs::create_dir_all(&config.cache_dir).unwrap();
+    write_job_event(&config, None, "ignored", Duration::from_millis(5));
+    assert!(logged_events(&config).is_empty(), "nothing was handed over");
+
+    let event = crate::events::BuildEvent::new_for_test("demo", crate::events::EventResult::Miss);
+    write_job_event(&config, Some(event), "", Duration::from_millis(1500));
+    write_job_event(
+        &config,
+        Some(crate::events::BuildEvent::new_for_test(
+            "demo",
+            crate::events::EventResult::Miss,
+        )),
+        "deferred debug bundle failed: x",
+        Duration::ZERO,
+    );
+    let events = logged_events(&config);
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].store_error, "");
+    assert_eq!(events[0].daemon_store_ms, 1500);
+    assert!(events[0].store_handed_off);
+    assert_eq!(events[1].store_error, "deferred debug bundle failed: x");
 }
 
 #[cfg(unix)]
@@ -1121,13 +1206,17 @@ fn a_processed_job_stores_one_entry_and_removes_its_directory() {
     let daemon = Arc::new(Daemon::new(config.clone()));
     let store = Store::open(&config).unwrap();
 
-    let job = accepted_job(&fixture, &config);
+    let job = accepted_job_with_event(&fixture, &config);
     let job_dir = job.dir.clone();
     assert_eq!(
         process_job(&daemon, &config, &store, job, &fake_dsymutil, NO_TIMEOUT),
         JobOutcome::Stored
     );
     assert!(!job_dir.exists());
+    let events = logged_events(&config);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].store_error, "");
+    assert!(events[0].store_handed_off);
     let meta = store.get(&key("demo")).unwrap().expect("stored");
     let mut names: Vec<_> = meta.files.iter().map(|file| file.name.as_str()).collect();
     names.sort();
@@ -1143,24 +1232,63 @@ fn a_processed_job_stores_one_entry_and_removes_its_directory() {
     assert!(!job_dir.exists());
 }
 
+/// [`accepted_job`] carrying the compile's event, as a wrapper sends it.
+fn accepted_job_with_event(fixture: &Fixture, config: &Config) -> DebugBundleJob {
+    let mut job = accepted_job(fixture, config);
+    job.request.event = Some(crate::events::BuildEvent::new_for_test(
+        "demo",
+        crate::events::EventResult::Miss,
+    ));
+    job
+}
+
 #[cfg(unix)]
 #[test]
-fn a_job_whose_bundle_fails_still_caches_the_executable() {
+fn a_job_whose_bundle_fails_stores_nothing_and_says_why() {
     let fixture = make_fixture(OBJECTS);
     let config = fixture_config(&fixture);
     let daemon = Arc::new(Daemon::new(config.clone()));
     let store = Store::open(&config).unwrap();
-    let job = accepted_job(&fixture, &config);
+    let job = accepted_job_with_event(&fixture, &config);
     let job_dir = job.dir.clone();
-    assert_eq!(
-        process_job(&daemon, &config, &store, job, &failing_dsymutil, NO_TIMEOUT),
-        JobOutcome::StoredWithoutBundle
+    let outcome = process_job(&daemon, &config, &store, job, &failing_dsymutil, NO_TIMEOUT);
+    assert!(
+        matches!(&outcome, JobOutcome::BundleFailed(error) if error.contains("cannot read")),
+        "{outcome:?}"
     );
     assert!(!job_dir.exists());
-    let meta = store.get(&key("demo")).unwrap().expect("stored");
-    let mut names: Vec<_> = meta.files.iter().map(|file| file.name.as_str()).collect();
-    names.sort();
-    assert_eq!(names, ["demo-1234", "demo-1234.d"]);
+    assert!(
+        store.get(&key("demo")).unwrap().is_none(),
+        "no executable is stored without its bundle"
+    );
+
+    // A run past its limit is killed and stores nothing either.
+    let job = accepted_job_with_event(&fixture, &config);
+    let outcome = process_job(
+        &daemon,
+        &config,
+        &store,
+        job,
+        &hanging_dsymutil,
+        Duration::from_millis(200),
+    );
+    assert!(
+        matches!(&outcome, JobOutcome::BundleFailed(error) if error.contains("was killed")),
+        "{outcome:?}"
+    );
+    assert!(store.get(&key("demo")).unwrap().is_none());
+
+    // Both compiles' events say why nothing was stored.
+    let events = logged_events(&config);
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(
+        events[0]
+            .store_error
+            .starts_with("deferred debug bundle failed: ")
+            && events[0].store_error.contains("cannot read"),
+        "{events:?}"
+    );
+    assert!(events[1].store_error.contains("was killed"), "{events:?}");
 }
 
 #[cfg(unix)]
@@ -1170,7 +1298,7 @@ fn a_dropped_job_stores_nothing_and_removes_its_directory() {
     let config = fixture_config(&fixture);
     let daemon = Arc::new(Daemon::new(config.clone()));
     let store = Store::open(&config).unwrap();
-    let job = accepted_job(&fixture, &config);
+    let job = accepted_job_with_event(&fixture, &config);
     let job_dir = job.dir.clone();
     daemon.debug_bundle_queue().close();
     assert_eq!(
@@ -1179,6 +1307,11 @@ fn a_dropped_job_stores_nothing_and_removes_its_directory() {
     );
     assert!(!job_dir.exists());
     assert!(store.get(&key("demo")).unwrap().is_none());
+    let events = logged_events(&config);
+    assert_eq!(
+        events[0].store_error,
+        "the daemon stopped before the deferred debug bundle was built"
+    );
 }
 
 #[cfg(unix)]
@@ -1189,11 +1322,12 @@ fn a_job_whose_put_fails_stores_nothing() {
     let daemon = Arc::new(Daemon::new(config.clone()));
     let store = Store::open(&config).unwrap();
     let job = accepted_job(&fixture, &config);
-    // The entry's executable vanished from the job: the put cannot read it.
-    std::fs::remove_file(job.dir.join(&job.request.executable)).unwrap();
-    assert_eq!(
-        process_job(&daemon, &config, &store, job, &failing_dsymutil, NO_TIMEOUT),
-        JobOutcome::Failed
+    // The entry's other file vanished from the job: the put cannot read it.
+    std::fs::remove_file(job.dir.join(&job.request.files[1].path)).unwrap();
+    let outcome = process_job(&daemon, &config, &store, job, &fake_dsymutil, NO_TIMEOUT);
+    assert!(
+        matches!(&outcome, JobOutcome::Failed(error) if !error.is_empty()),
+        "{outcome:?}"
     );
     assert!(store.get(&key("demo")).unwrap().is_none());
 }
