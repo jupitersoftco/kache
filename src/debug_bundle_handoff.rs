@@ -1292,6 +1292,8 @@ fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
 
 /// Uplift links are a macOS concern; nothing links elsewhere.
 #[cfg(not(unix))]
+// The mutation lane runs on Linux and never compiles this body.
+#[mutants::skip]
 fn symlink_dir(_target: &Path, _link: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
