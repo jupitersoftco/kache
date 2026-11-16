@@ -564,9 +564,9 @@ pub struct Config {
     /// wrapper stores on its own either way.
     pub daemon_publish: bool,
     /// When a cached macOS executable with unpacked debug info gets its
-    /// `.dSYM` bundle: `sync` (default) runs `dsymutil` before the wrapper
-    /// returns; `deferred` hands it to a running daemon together with the
-    /// store, and stores nothing when the daemon cannot take it.
+    /// `.dSYM` bundle: `deferred` (this fork's default) hands it to a running
+    /// daemon together with the store, and stores nothing when the daemon
+    /// cannot take it; `sync` runs `dsymutil` before the wrapper returns.
     /// `KACHE_MACOS_DEBUG_BUNDLE` or `[cache] macos_debug_bundle`.
     pub macos_debug_bundle: MacosDebugBundle,
     /// Prepare cold MSVC runtime hashes in the daemon while native units compile.
@@ -1205,6 +1205,7 @@ pub struct EnvOverrides {
     pub s3_user_agent: bool,
     pub fallback: bool,
     pub key_salt: bool,
+    pub macos_debug_bundle: bool,
 }
 
 impl EnvOverrides {
@@ -1227,6 +1228,7 @@ impl EnvOverrides {
             s3_user_agent: env_or_ignored("KACHE_S3_USER_AGENT", ignore_env).is_ok(),
             fallback: env_or_ignored("KACHE_FALLBACK", ignore_env).is_ok(),
             key_salt: env_or_ignored("KACHE_KEY_SALT", ignore_env).is_ok(),
+            macos_debug_bundle: env_or_ignored("KACHE_MACOS_DEBUG_BUNDLE", ignore_env).is_ok(),
         }
     }
 }
@@ -3455,7 +3457,7 @@ impl Config {
     }
 
     /// `KACHE_MACOS_DEBUG_BUNDLE` (env wins), else
-    /// `[cache] macos_debug_bundle`, else `sync`. An unknown value warns and
+    /// `[cache] macos_debug_bundle`, else `deferred`. An unknown value warns and
     /// falls through to the next source. See [`Config::macos_debug_bundle`].
     fn macos_debug_bundle_for(
         invocation: &InvocationEnv,
@@ -5430,13 +5432,15 @@ fn parse_index_mode(value: &str, source: &str) -> Option<IndexMode> {
 /// bundle that is stored with it (kunobi-ninja/kache#319).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MacosDebugBundle {
-    /// `dsymutil` runs before the wrapper returns to Cargo.
-    #[default]
+    /// `dsymutil` runs before the wrapper returns to Cargo. Upstream's
+    /// behavior; an explicit choice in this fork.
     Sync,
     /// A running daemon runs `dsymutil` from link-time clones of the
     /// executable and its objects, then stores executable and bundle as one
     /// entry. Without a daemon that accepts the job, the executable is not
-    /// stored by that compile; `dsymutil` never runs in the wrapper.
+    /// stored by that compile; `dsymutil` never runs in the wrapper. This
+    /// fork's default.
+    #[default]
     Deferred,
 }
 

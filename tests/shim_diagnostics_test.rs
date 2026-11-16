@@ -17,6 +17,9 @@ fn executable(path: &Path, source: &str) {
 fn init_detects_projected_fallback_loops_and_real_overrides_repair_both_tools() {
     let scratch = tempfile::tempdir().unwrap();
     let root = scratch.path().canonicalize().unwrap();
+    // The rustdoc shim's compile below auto-starts a daemon for this cache.
+    // Declared after the TempDir, so it stops the daemon first.
+    let daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), root.join("cache"));
     let farm = root.join("custom farm");
     let manager = root.join("version manager");
     let real = root.join("real tools");
@@ -140,4 +143,7 @@ fn init_detects_projected_fallback_loops_and_real_overrides_repair_both_tools() 
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("rustdoc 1.99.0"));
+    drop(daemon);
+    common::wait_for_daemon_exit(&root.join("cache"), Duration::from_secs(10))
+        .expect("the test leaves no daemon running");
 }

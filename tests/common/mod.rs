@@ -171,6 +171,10 @@ pub fn hermetic_command(
         // Cache-contract fixtures require the first native compile to store.
         // The dedicated Windows warmup probe exercises background admission.
         .env("KACHE_NATIVE_RUNTIME_WARMUP", "0")
+        // Cache-contract fixtures also read a macOS executable's entry and
+        // event as soon as the build returns. This fork defers the bundle by
+        // default, which stores both later, from the daemon.
+        .env("KACHE_MACOS_DEBUG_BUNDLE", "sync")
         .env_remove("KACHE_SOCKET_PATH")
         .env_remove("KACHE_EVENT_ROOT")
         .env_remove("KACHE_ACTIVE")

@@ -256,6 +256,20 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
             validation_error: None,
             env_locked: false,
         },
+        FormField {
+            key: "macos_debug_bundle",
+            label: "macOS debug bundle",
+            kind: FieldKind::Text,
+            value: cache
+                .and_then(|c| c.macos_debug_bundle.clone())
+                .unwrap_or_default(),
+            env_var: "KACHE_MACOS_DEBUG_BUNDLE",
+            env_value: env_val("KACHE_MACOS_DEBUG_BUNDLE"),
+            // This fork's default; `sync` is the explicit alternative.
+            default_hint: "deferred",
+            validation_error: None,
+            env_locked: env.macos_debug_bundle,
+        },
         // [Remote]
         FormField {
             key: "remote_type",
@@ -462,15 +476,15 @@ fn build_sections() -> Vec<Section> {
         },
         Section {
             label: "Caching",
-            fields: 3..10,
+            fields: 3..11,
         },
         Section {
             label: "Remote",
-            fields: 10..21,
+            fields: 11..22,
         },
         Section {
             label: "Advanced",
-            fields: 21..23,
+            fields: 22..24,
         },
     ]
 }
@@ -480,6 +494,11 @@ fn build_sections() -> Vec<Section> {
 fn validate_field(field: &FormField) -> Option<String> {
     if field.value.is_empty() {
         return None;
+    }
+    if field.key == "macos_debug_bundle" {
+        return crate::config::MacosDebugBundle::parse(&field.value)
+            .is_none()
+            .then(|| "Expected \"deferred\" or \"sync\"".to_string());
     }
     match field.kind {
         FieldKind::Size => {
@@ -838,6 +857,7 @@ fn fields_to_file_config(fields: &[FormField], original: &FileConfig) -> FileCon
     cache.event_log_keep_lines = get_usize("event_log_keep_lines");
     cache.fallback = get("fallback");
     cache.key_salt = get("key_salt");
+    cache.macos_debug_bundle = get("macos_debug_bundle");
     cache.remote = remote;
     config
 }
@@ -1410,20 +1430,73 @@ mod tests {
             s3_prefix: false,
             s3_profile: false,
             s3_user_agent: false,
+            macos_debug_bundle: false,
         }
+    }
+
+    #[test]
+    fn the_macos_debug_bundle_field_shows_the_deferred_default_and_saves_a_choice() {
+        let config: FileConfig =
+            toml::from_str("[cache]\nmacos_debug_bundle = \"sync\"\n").unwrap();
+        let env = EnvOverrides {
+            macos_debug_bundle: true,
+            ..empty_env()
+        };
+        let fields = build_fields(&config, &env);
+        let field = fields
+            .iter()
+            .find(|field| field.key == "macos_debug_bundle")
+            .unwrap();
+        assert_eq!(field.value, "sync");
+        assert_eq!(field.default_hint, "deferred");
+        assert_eq!(field.env_var, "KACHE_MACOS_DEBUG_BUNDLE");
+        assert!(field.env_locked);
+        assert!(
+            !build_fields(&FileConfig::default(), &empty_env())
+                .iter()
+                .find(|field| field.key == "macos_debug_bundle")
+                .unwrap()
+                .env_locked
+        );
+
+        let mut field = field.clone();
+        for (value, valid) in [("sync", true), (" Deferred ", true), ("later", false)] {
+            field.value = value.to_string();
+            assert_eq!(validate_field(&field).is_none(), valid, "{value:?}");
+        }
+        // Only this field takes the mode names: other text stays free-form.
+        let mut other = fields
+            .iter()
+            .find(|field| field.key == "fallback")
+            .unwrap()
+            .clone();
+        other.value = "later".to_string();
+        assert_eq!(validate_field(&other), None);
+
+        let mut fields = fields;
+        fields
+            .iter_mut()
+            .find(|field| field.key == "macos_debug_bundle")
+            .unwrap()
+            .value = "deferred".to_string();
+        let saved = fields_to_file_config(&fields, &config);
+        assert_eq!(
+            saved.cache.unwrap().macos_debug_bundle.as_deref(),
+            Some("deferred")
+        );
     }
 
     #[test]
     fn test_build_fields_count() {
         let config = FileConfig::default();
         let fields = build_fields(&config, &empty_env());
-        assert_eq!(fields.len(), 23);
+        assert_eq!(fields.len(), 24);
 
         let sections = build_sections();
         assert_eq!(sections[0].fields, 0..3);
-        assert_eq!(sections[1].fields, 3..10);
-        assert_eq!(sections[2].fields, 10..21);
-        assert_eq!(sections[3].fields, 21..23);
+        assert_eq!(sections[1].fields, 3..11);
+        assert_eq!(sections[2].fields, 11..22);
+        assert_eq!(sections[3].fields, 22..24);
     }
 
     #[test]

@@ -112,10 +112,11 @@ struct Symtab {
 fn read_oso_strings(file: &mut (impl Read + Seek), symtab: Symtab) -> Result<Vec<String>> {
     let mut string_offsets = Vec::new();
     let mut chunk = vec![0_u8; SYMBOLS_PER_CHUNK * NLIST_64_LEN];
-    let mut read = 0;
     file.seek(SeekFrom::Start(symtab.symoff))?;
-    while read < symtab.nsyms {
-        let count = (symtab.nsyms - read).min(SYMBOLS_PER_CHUNK);
+    // Each pass reads a whole chunk or fails, and `step_by` refuses a zero
+    // step, so the walk ends after nsyms / SYMBOLS_PER_CHUNK passes at most.
+    for first in (0..symtab.nsyms).step_by(SYMBOLS_PER_CHUNK) {
+        let count = (symtab.nsyms - first).min(SYMBOLS_PER_CHUNK);
         let bytes = &mut chunk[..count * NLIST_64_LEN];
         file.read_exact(bytes)
             .context("symbol table runs past the end of the file")?;
@@ -124,7 +125,6 @@ fn read_oso_strings(file: &mut (impl Read + Seek), symtab: Symtab) -> Result<Vec
                 string_offsets.push(u64::from(le32(symbol, 0)));
             }
         }
-        read += count;
     }
 
     let mut objects: Vec<String> = Vec::new();
@@ -267,6 +267,49 @@ pub(crate) mod tests {
         let image = synthetic_macho(Some(UUID), &symbols);
         let map = read_debug_map(&mut Cursor::new(image)).unwrap().unwrap();
         assert_eq!(map.objects, ["deps/late.o"]);
+    }
+
+    #[test]
+    fn a_string_is_read_only_inside_the_string_table() {
+        // A table of "abc" with no terminator, then a NUL past its end.
+        let file = || Cursor::new(b"abc\0".to_vec());
+        let table = Symtab {
+            symoff: 0,
+            nsyms: 0,
+            stroff: 0,
+            strsize: 3,
+        };
+        for offset in [0, 1, 2] {
+            let error = read_string(&mut file(), table, offset).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("is not terminated"),
+                "{offset}: {error:#}"
+            );
+        }
+        let error = read_string(&mut file(), table, 3).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("outside the string table"),
+            "{error:#}"
+        );
+        let whole = Symtab {
+            strsize: 4,
+            ..table
+        };
+        assert_eq!(read_string(&mut file(), whole, 1).unwrap(), "bc");
+    }
+
+    #[test]
+    fn a_symbol_table_past_the_end_of_the_file_is_an_error() {
+        let symbols = vec![(N_OSO, "deps/a.o"); 3];
+        let mut image = synthetic_macho(Some(UUID), &symbols);
+        // Keep the header and load commands; drop the symbols they name.
+        image.truncate(32 + le32(&image, 20) as usize);
+        let error = read_debug_map(&mut Cursor::new(image)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("symbol table runs past the end of the file"),
+            "{error:#}"
+        );
+        assert_eq!(SYMBOLS_PER_CHUNK, 16_384);
     }
 
     #[test]

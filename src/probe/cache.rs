@@ -213,6 +213,23 @@ pub fn store(cache_dir: &Path, key: &str, config: &ResolvedConfig) {
     let _ = tmp.persist(record_path(cache_dir, key));
 }
 
+/// Take the key's probe lock, waiting while another caller holds it. Held
+/// across a miss's probe and store, it makes concurrent callers in this
+/// process or another run one probe; the rest read the stored record.
+/// `None` when the lock cannot be taken: the caller probes without it.
+pub(crate) fn lock(cache_dir: &Path, key: &str) -> Option<std::fs::File> {
+    let dir = cache_dir.join(PROBE_SUBDIR);
+    std::fs::create_dir_all(&dir).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("{key}.lock")))
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
+}
+
 fn record_path(cache_dir: &Path, key: &str) -> PathBuf {
     cache_dir.join(PROBE_SUBDIR).join(format!("{key}.json"))
 }
