@@ -14349,3 +14349,46 @@ fn scheduler_cancellation_guard_keeps_an_existing_error_event() {
     assert_eq!(events[0].elapsed_ms, 19);
     assert_eq!(events[0].scheduler_decisions[0].elapsed_ms, 17);
 }
+
+#[test]
+fn daemon_event_writes_wait_out_a_busy_log_and_lose_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let log = config.event_log_path();
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    let mut lock_path = log.clone().into_os_string();
+    lock_path.push(".lock");
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    holder.lock().unwrap();
+    let event = |name: &str| {
+        crate::events::BuildEvent::new_for_test(name, crate::events::EventResult::Miss)
+    };
+    // A build gives up on a busy log after a few milliseconds.
+    write_event(&config, &event("build"));
+    let (writers, each) = (4, 5);
+    std::thread::scope(|threads| {
+        for writer in 0..writers {
+            let (config, event) = (&config, &event);
+            threads.spawn(move || {
+                for n in 0..each {
+                    write_event_waiting(config, &event(&format!("daemon-{writer}-{n}")));
+                }
+            });
+        }
+        // Far past the build's budget; the daemon's writers wait it out.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        holder.unlock().unwrap();
+    });
+    let events = crate::events::read_events(&log).unwrap();
+    assert_eq!(events.len(), writers * each, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.crate_name.starts_with("daemon-"))
+    );
+}

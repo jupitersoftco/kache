@@ -480,7 +480,7 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
     // the key next must find a committed entry, and nothing of ours left.
     discard_handoff_files(&request);
     if owns_event {
-        crate::wrapper::write_event(config, &event);
+        crate::wrapper::write_event_waiting(config, &event);
     }
     drop(_lock);
     daemon.publish_queue().progress.finished();
