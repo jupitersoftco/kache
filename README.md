@@ -1,24 +1,32 @@
 > [!NOTE]
-> **This is an unofficial fork of [kunobi-ninja/kache](https://github.com/kunobi-ninja/kache), based on v2.1.1.
-> It is not affiliated with or endorsed by Kunobi.** Use upstream unless you need the change below.
->
-> **Why the fork exists:** on macOS, Kache stores each linked executable with a relocatable `.dSYM`.
-> Upstream builds that bundle (`dsymutil` plus a tar) synchronously, before rustc returns to Cargo.
-> For a large test harness that adds about 10 s to every edit-and-rebuild.
-> This fork adds `cache.macos_debug_bundle = "deferred"` (env `KACHE_MACOS_DEBUG_BUNDLE`), and makes it the default.
-> The daemon builds and stores the bundle in the background after the build returns.
-> Cache keys and stored entries are the same as with upstream's `"sync"`.
-> Until the daemon installs the bundle (usually well under a second; longer for very large binaries), a freshly
-> linked executable's backtraces and lldb sessions have no file:line information.
-> If the daemon cannot take the bundle (for example its queue is full) or `dsymutil` fails, that executable is
-> simply not cached: no `dsymutil` runs on Cargo's critical path, and no executable is stored without its bundle.
-> Such an executable gets no `.dSYM` until its next link. Its debug map is relative to Cargo's profile directory
-> (Kache links with `-oso_prefix`), so lldb resolves its file:line only when started from that directory.
-> To get upstream's behavior back, set `macos_debug_bundle = "sync"` under `[cache]` or `KACHE_MACOS_DEBUG_BUNDLE=sync`:
-> `dsymutil` then runs before rustc returns, and the `.dSYM` is there when the build does.
-> The change is on the `deferred-debug-bundle` branch and in the commit history.
-> All other code is upstream's, under the same Apache-2.0 license (see `LICENSE`).
-> It may be offered upstream after wider validation.
+> **Unofficial fork** of [kunobi-ninja/kache](https://github.com/kunobi-ninja/kache), kept rebased on upstream `main`.
+> Not affiliated with or endorsed by Kunobi. Use upstream unless you need the changes below.
+
+<details>
+<summary><strong>What this fork changes</strong></summary>
+
+**Deferred macOS debug bundles (the default here).** Upstream runs `dsymutil` synchronously before rustc returns,
+which adds about 10 s to every edit-and-rebuild of a large test harness. Here the daemon builds and stores the
+`.dSYM` in the background instead.
+
+- Cache keys and stored entries are identical to upstream's `"sync"` mode.
+- Until the bundle lands (usually well under a second), a freshly linked executable has no file:line debug info.
+- If the daemon can't take the job, that executable is simply not cached: `dsymutil` never runs on Cargo's
+  critical path, and nothing is stored without its bundle.
+- Upstream behaviour: `macos_debug_bundle = "sync"` under `[cache]`, or `KACHE_MACOS_DEBUG_BUNDLE=sync`.
+
+**Robustness fixes found while validating it**
+
+- `kache daemon stop` drains queued bundle jobs within a bound, kills any `dsymutil` it abandons, and records
+  dropped jobs as events.
+- Event-log locks are released explicitly and waited for, not dropped, under load.
+- Compiler probes run once per key across concurrent callers.
+- The process-liveness test fixture works on macOS 26, which kills copied platform binaries.
+
+Each change is a separate commit on top of upstream, so `git log upstream/main..main` lists exactly what differs.
+Everything else is upstream's code, under the same Apache-2.0 license (see `LICENSE`).
+
+</details>
 
 [![CI](https://github.com/kunobi-ninja/kache/actions/workflows/ci.yml/badge.svg)](https://github.com/kunobi-ninja/kache/actions/workflows/ci.yml)
 [![Bench](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml/badge.svg)](https://github.com/kunobi-ninja/kache/actions/workflows/bench.yml)
