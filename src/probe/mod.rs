@@ -828,6 +828,19 @@ pub(crate) fn probe_for(
         return Ok(hit);
     }
 
+    // A miss probes under the key's lock. A caller that waited for it finds
+    // the record the holder stored and runs no probe of its own.
+    let flight = match (&key, &cache_dir) {
+        (Some(key), Some(cache_dir)) => {
+            let flight = cache::lock(cache_dir, key);
+            if let Some(hit) = cache::load(cache_dir, key) {
+                return Ok(hit);
+            }
+            flight
+        }
+        _ => None,
+    };
+
     // Miss, or the probe could not be keyed: run the real probe.
     crate::opcounts::record_probe_run();
     let config = prober.probe_for(req, env)?;
@@ -837,6 +850,7 @@ pub(crate) fn probe_for(
     {
         cache::store(cache_dir, key, &config);
     }
+    drop(flight);
     Ok(config)
 }
 
@@ -859,6 +873,7 @@ mod tests {
     #[derive(Default)]
     struct CountingProber {
         runs: AtomicUsize,
+        delay: std::time::Duration,
     }
 
     impl Prober for CountingProber {
@@ -868,6 +883,7 @@ mod tests {
 
         fn probe(&self, _req: &ProbeRequest<'_>) -> Result<ResolvedConfig> {
             self.runs.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
             Ok(ResolvedConfig {
                 schema_version: PROBE_SCHEMA_VERSION,
                 prober: "test".to_string(),
@@ -1027,10 +1043,15 @@ printf 'host %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD"
                 });
             }
         });
-        assert_eq!(
-            std::fs::read_dir(cache_dir.join("probes")).unwrap().count(),
-            6
-        );
+        let records = std::fs::read_dir(cache_dir.join("probes"))
+            .unwrap()
+            .filter(|entry| {
+                let path = entry.as_ref().unwrap().path();
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .count();
+        assert_eq!(records, 6);
     }
 
     #[test]
@@ -1083,6 +1104,50 @@ printf 'host %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD"
             prober.runs.load(Ordering::SeqCst),
             1,
             "second probe must be served from the on-disk cache"
+        );
+    }
+
+    #[test]
+    fn concurrent_misses_for_one_key_run_one_probe() {
+        let cache = TempDir::new().unwrap();
+        // Stat-able stand-in for the compiler; the prober never execs it.
+        let compiler = NamedTempFile::new().unwrap();
+        // The holder sleeps inside the probe, so the other callers miss the
+        // first read and must wait on the lock rather than probe.
+        let prober = CountingProber {
+            delay: std::time::Duration::from_millis(200),
+            ..CountingProber::default()
+        };
+        let req = req(compiler.path().to_str().unwrap());
+        // An explicit snapshot: other tests mutate the live environment, and
+        // a changed environment is a different key.
+        let env = InvocationEnv::from_parts(
+            [("PATH", std::ffi::OsString::from("/usr/bin"))],
+            Some(cache.path().to_path_buf()),
+            None,
+            std::env::temp_dir(),
+        );
+        let callers = 4;
+        let barrier = std::sync::Barrier::new(callers);
+        let results: Vec<_> = std::thread::scope(|threads| {
+            let handles: Vec<_> = (0..callers)
+                .map(|_| {
+                    threads.spawn(|| {
+                        barrier.wait();
+                        probe_for(cache.path(), &prober, &req, &env).unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        assert!(results.iter().all(|result| *result == results[0]));
+        assert_eq!(
+            prober.runs.load(Ordering::SeqCst),
+            1,
+            "callers that waited must read the holder's record"
         );
     }
 
