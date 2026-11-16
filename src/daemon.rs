@@ -7173,8 +7173,8 @@ pub(crate) async fn drain_publications_then_close_uploads(
 /// receiver resolves once the workers have exited.
 fn start_debug_bundle_workers(daemon: &Arc<Daemon>) -> Result<tokio::sync::oneshot::Receiver<()>> {
     let removed = crate::debug_bundle_handoff::remove_abandoned_jobs(daemon.config());
-    if removed > 0 {
-        tracing::info!("removed {removed} debug bundle jobs a previous daemon left");
+    if let Some(note) = crate::debug_bundle_handoff::abandoned_jobs_note(removed) {
+        tracing::info!("{note}");
     }
     let (tx, rx) = tokio::sync::mpsc::channel(crate::debug_bundle_handoff::QUEUE_CAPACITY);
     daemon.debug_bundle_queue().set_sender(tx);
