@@ -45,7 +45,22 @@ fn the_scan_deadline_includes_its_boundary() {
     assert_eq!(SCAN_LIMIT, Duration::from_millis(2000));
 }
 
-/// A native system program started directly, without a Cargo or Kache lease.
+/// The ignored test a copied test binary runs as a [`RunningProgram`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const SLEEPER_TEST: &str = "target_processes::tests::running_program_fixture_sleeps_until_killed";
+
+/// Names the parent PID; the sleeper returns at once without it, so running
+/// every ignored test does not hang for a minute.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const SLEEPER_PARENT: &str = "KACHE_RUNNING_PROGRAM_PARENT";
+
+/// A native program started directly, without a Cargo or Kache lease.
+///
+/// The executable is a copy under the target, so the process scan reports a
+/// path inside it. By default the copy is this test binary running
+/// [`SLEEPER_TEST`]: macOS 26 kills a copied platform binary such as
+/// `/bin/sleep` right after launch. `KACHE_TEST_SLEEP` names a non-platform
+/// `sleep` instead (the Nix lanes set it to coreutils).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) struct RunningProgram(std::process::Child);
 
@@ -53,38 +68,98 @@ pub(crate) struct RunningProgram(std::process::Child);
 impl RunningProgram {
     pub(crate) fn start(target: &Path) -> Self {
         std::fs::create_dir_all(target).unwrap();
-        // Coreutils can dispatch by executable name in multicall builds.
+        // Coreutils can dispatch by executable name in multicall builds, so
+        // the copy is `sleep` whichever program it is.
         let executable = target.join("sleep");
-        let sleep = option_env!("KACHE_TEST_SLEEP").unwrap_or("/bin/sleep");
+        let mut command = std::process::Command::new(&executable);
+        let (source, copier) = match option_env!("KACHE_TEST_SLEEP") {
+            Some(sleep) => {
+                command.arg("60");
+                (PathBuf::from(sleep), Path::new(sleep).with_file_name("cp"))
+            }
+            None => {
+                command
+                    .args(["--exact", SLEEPER_TEST, "--ignored", "--nocapture"])
+                    .arg("--test-threads=1")
+                    .env(SLEEPER_PARENT, std::process::id().to_string());
+                (std::env::current_exe().unwrap(), PathBuf::from("/bin/cp"))
+            }
+        };
         // A child writes the executable so another test thread cannot fork
         // with its writable descriptor and make the next exec fail (ETXTBSY).
-        let copied = std::process::Command::new(Path::new(sleep).with_file_name("cp"))
-            .arg(sleep)
-            .arg(&executable)
-            .status()
-            .expect("start the packaged executable copier");
+        let copy = |clone: bool| {
+            let mut run = std::process::Command::new(&copier);
+            if clone {
+                // A failed clone is retried as a copy; its message is noise.
+                run.arg("-c").stderr(std::process::Stdio::null());
+            }
+            run.arg(&source)
+                .arg(&executable)
+                .status()
+                .unwrap_or_else(|error| panic!("start {}: {error}", copier.display()))
+        };
+        // The test binary is large. On macOS clone it (clonefile: no bytes
+        // copied when both paths share an APFS volume). The clone is a file
+        // of its own, so the process scan reports the clone's path. Another
+        // volume takes a byte copy, as other systems and `sleep` always do.
+        let clone = cfg!(target_os = "macos") && option_env!("KACHE_TEST_SLEEP").is_none();
+        let copied = match copy(clone) {
+            status if clone && !status.success() => copy(false),
+            status => status,
+        };
         assert!(
             copied.success(),
-            "copying the process fixture failed: {copied}"
+            "copying the process fixture {} failed: {copied}",
+            source.display()
         );
-        let program = Self(
-            std::process::Command::new(&executable)
-                .arg("60")
+        // Owned before any assertion below, so a failed start still kills
+        // and reaps the child.
+        let mut program = Self(
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()
                 .unwrap(),
         );
         let executable = executable.canonicalize().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = false;
         loop {
+            program.assert_running(&executable);
             let paths = scan(deadline).expect("process table must be readable for this test");
-            if paths.contains(&executable) {
-                return program;
+            match (paths.contains(&executable), seen) {
+                // A second scan, after a pause, proves the program outlived
+                // its launch rather than being killed straight after exec.
+                (true, true) => {
+                    program.assert_running(&executable);
+                    return program;
+                }
+                (true, false) => {
+                    seen = true;
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                (false, true) => panic!(
+                    "process fixture {} left the process table after one scan",
+                    executable.display()
+                ),
+                (false, false) => {}
             }
             assert!(
                 Instant::now() < deadline,
                 "child did not exec its target binary"
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_running(&mut self, executable: &Path) {
+        if let Some(status) = self.0.try_wait().unwrap() {
+            panic!(
+                "process fixture {} exited after launch: {status}",
+                executable.display()
+            );
         }
     }
 }
@@ -95,6 +170,40 @@ impl Drop for RunningProgram {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// The program a copied test binary runs for [`RunningProgram`]. It stops
+/// after a minute or when the test process that started it is gone, so an
+/// aborted run leaves no sleeper behind.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+#[ignore = "process fixture started by RunningProgram"]
+fn running_program_fixture_sleeps_until_killed() {
+    let Some(parent) = std::env::var(SLEEPER_PARENT)
+        .ok()
+        .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+    else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // SAFETY: getppid has no arguments or failure case.
+    while Instant::now() < deadline && unsafe { libc::getppid() } == parent {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_running_program_is_killed_and_reaped_on_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target");
+    let child = RunningProgram::start(&target);
+    let pid = child.0.id() as libc::pid_t;
+    drop(child);
+    // SAFETY: signal 0 only checks existence; the PID was reaped by drop, so
+    // ESRCH means no zombie remains.
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
