@@ -932,7 +932,7 @@ fn index_mode_defaults_to_auto_and_obeys_invocation_precedence() {
 }
 
 #[test]
-fn macos_debug_bundle_defaults_to_sync_and_obeys_invocation_precedence() {
+fn macos_debug_bundle_defaults_to_deferred_and_obeys_invocation_precedence() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     let loaded = |value: Option<&str>| {
@@ -955,6 +955,12 @@ fn macos_debug_bundle_defaults_to_sync_and_obeys_invocation_precedence() {
         Config::load_for(&invocation).unwrap().macos_debug_bundle
     };
 
+    // This fork defers by default; the default type agrees with the loader.
+    assert_eq!(loaded(None), MacosDebugBundle::Deferred);
+    assert_eq!(MacosDebugBundle::default(), MacosDebugBundle::Deferred);
+    // Either source still selects sync.
+    assert_eq!(loaded(Some("sync")), MacosDebugBundle::Sync);
+    std::fs::write(&config_path, "[cache]\nmacos_debug_bundle = \"sync\"\n").unwrap();
     assert_eq!(loaded(None), MacosDebugBundle::Sync);
 
     std::fs::write(&config_path, "[cache]\nmacos_debug_bundle = \"deferred\"\n").unwrap();
@@ -967,14 +973,15 @@ fn macos_debug_bundle_defaults_to_sync_and_obeys_invocation_precedence() {
     assert_eq!(loaded(Some("DEFERRED")), MacosDebugBundle::Deferred);
 
     std::fs::write(&config_path, "[cache]\nmacos_debug_bundle = \"async\"\n").unwrap();
-    assert_eq!(loaded(None), MacosDebugBundle::Sync);
+    assert_eq!(loaded(None), MacosDebugBundle::Deferred);
+    assert_eq!(loaded(Some("later")), MacosDebugBundle::Deferred);
 
     std::fs::write(
         &config_path,
-        "[cache]\nignore_env = true\nmacos_debug_bundle = \"deferred\"\n",
+        "[cache]\nignore_env = true\nmacos_debug_bundle = \"sync\"\n",
     )
     .unwrap();
-    assert_eq!(loaded(Some("sync")), MacosDebugBundle::Deferred);
+    assert_eq!(loaded(Some("deferred")), MacosDebugBundle::Sync);
 }
 
 #[test]

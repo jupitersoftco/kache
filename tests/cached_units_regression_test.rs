@@ -109,6 +109,9 @@ fn walkdir(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// `ignore_env` hides the hermetic environment's `KACHE_MACOS_DEBUG_BUNDLE`,
+/// so the file pins `sync` itself: these fixtures read an executable's entry
+/// as soon as the build returns.
 fn write_config(cache: &Path) -> PathBuf {
     let config = cache.join("config.toml");
     let quoted = toml::Value::String(cache.to_string_lossy().into_owned()).to_string();
@@ -116,7 +119,8 @@ fn write_config(cache: &Path) -> PathBuf {
         &config,
         format!(
             "[cache]\nlocal_only = true\nignore_env = true\ninput_predictions = true\n\
-             scheduler = true\nlocal_store = {quoted}\nruntime_dir = {quoted}\n"
+             scheduler = true\nlocal_store = {quoted}\nruntime_dir = {quoted}\n\
+             macos_debug_bundle = \"sync\"\n"
         ),
     )
     .unwrap();
