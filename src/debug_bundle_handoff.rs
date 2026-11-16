@@ -33,13 +33,17 @@
 //!   grows with the job's inputs, stores nothing: no executable is stored
 //!   without its bundle. The daemon writes the compile's event once the job
 //!   ends, with the reason in its store error when nothing was stored, so
-//!   `kache stats` and `kache explain` show it. Jobs are not persisted: a
-//!   daemon that stops drops them, and the next daemon removes their
-//!   directories before it accepts work.
+//!   `kache stats` and `kache explain` show it. Jobs are not persisted. A
+//!   daemon that stops refuses new jobs, drops queued ones and gives running
+//!   ones [`DRAIN_BUDGET`] to finish; then it kills their `dsymutil` (with
+//!   its process group) and drops them too. Each dropped job writes its
+//!   event. The next daemon removes the job directories one that crashed
+//!   left before it accepts work.
 
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -90,6 +94,15 @@ const DSYMUTIL_TIMEOUT_FLOOR: Duration = Duration::from_secs(600);
 /// executable with 4.1 GiB of objects took 217 s at utility priority with
 /// two threads, about 50 ms per MiB; this allows five times that.
 const DSYMUTIL_TIMEOUT_PER_MIB: Duration = Duration::from_millis(250);
+/// How long a stopping daemon lets running jobs finish before it kills their
+/// `dsymutil`. The publish worker's stall window: both drains run at once.
+pub(crate) const DRAIN_BUDGET: Duration = crate::daemon_publish::PUBLISH_DRAIN_STALL;
+/// After [`DRAIN_BUDGET`], how long the workers get to kill and reap their
+/// `dsymutil` and write the events of the jobs left. Each checks every
+/// [`POLL`].
+pub(crate) const ABORT_GRACE: Duration = Duration::from_secs(2);
+/// How often a worker checks its `dsymutil`.
+const POLL: Duration = Duration::from_millis(20);
 /// Age after which a sibling `.<name>.dSYM.kache-*` directory is taken to be
 /// one a stopped daemon left behind mid-install.
 const INSTALL_LEFTOVER_AGE: Duration = Duration::from_secs(3600);
@@ -450,14 +463,16 @@ pub(crate) struct DebugBundleJob {
 /// The daemon's queue of accepted jobs, drained by [`WORKERS`] threads.
 pub(crate) struct DebugBundleQueue {
     tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<DebugBundleJob>>>,
-    closing: Arc<std::sync::atomic::AtomicBool>,
+    closing: AtomicBool,
+    aborting: AtomicBool,
 }
 
 impl DebugBundleQueue {
     pub(crate) fn new() -> Self {
         Self {
             tx: std::sync::Mutex::new(None),
-            closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            closing: AtomicBool::new(false),
+            aborting: AtomicBool::new(false),
         }
     }
 
@@ -471,18 +486,29 @@ impl DebugBundleQueue {
         self.tx.lock().ok().and_then(|slot| slot.clone())
     }
 
-    /// Refuse new jobs and drop queued ones. A running `dsymutil` finishes,
-    /// but nothing more is stored: an unstored entry is only a later miss.
+    /// Refuse new jobs and drop queued ones, each with its event. A running
+    /// job goes on and stores its entry if it finishes before [`Self::abort`].
     pub(crate) fn close(&self) {
-        self.closing
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.closing.store(true, Ordering::Release);
         if let Ok(mut slot) = self.tx.lock() {
             slot.take();
         }
     }
 
+    /// [`Self::close`], and stop running jobs too: a worker kills its
+    /// `dsymutil` within [`POLL`] and drops the job. An unstored entry is
+    /// only a later miss.
+    pub(crate) fn abort(&self) {
+        self.aborting.store(true, Ordering::Release);
+        self.close();
+    }
+
     fn is_closing(&self) -> bool {
-        self.closing.load(std::sync::atomic::Ordering::Acquire)
+        self.closing.load(Ordering::Acquire)
+    }
+
+    fn is_aborting(&self) -> bool {
+        self.aborting.load(Ordering::Acquire)
     }
 }
 
@@ -612,27 +638,63 @@ pub(crate) fn remove_abandoned_jobs(config: &Config) -> usize {
 }
 
 /// Start the workers. Each has its own store connection and runs one job
-/// at a time; they share the queue.
+/// at a time; they share the queue. The receiver resolves once every worker
+/// has exited, after [`DebugBundleQueue::close`] and the queue's last job:
+/// each worker holds the sender until it returns or panics, and the receiver
+/// completes when the last one is dropped. [`drain_jobs`] bounds that wait.
 pub(crate) fn spawn_workers(
     daemon: Arc<Daemon>,
     rx: tokio::sync::mpsc::Receiver<DebugBundleJob>,
-) -> std::io::Result<()> {
+) -> std::io::Result<tokio::sync::oneshot::Receiver<()>> {
     let runtime = tokio::runtime::Handle::current();
     let rx = Arc::new(std::sync::Mutex::new(rx));
+    let (running, done) = tokio::sync::oneshot::channel::<()>();
+    let running = Arc::new(running);
     for index in 0..WORKERS {
         let daemon = Arc::clone(&daemon);
         let rx = Arc::clone(&rx);
         let runtime = runtime.clone();
+        let running = Arc::clone(&running);
         std::thread::Builder::new()
             .name(format!("kache-dsym-{index}"))
             .spawn(move || {
+                let _running = running;
                 // Uploads are queued through the runtime, as for cc publishes.
                 let _runtime = runtime.enter();
                 lower_thread_priority();
                 run_worker(&daemon, &rx);
             })?;
     }
-    Ok(())
+    Ok(done)
+}
+
+/// Wait for the workers to exit after [`DebugBundleQueue::close`]: `budget`
+/// for running jobs to finish, then [`DebugBundleQueue::abort`] and `grace`
+/// for the workers to kill their `dsymutil` and drop what is left. Whether
+/// they exited; a worker that did not is in a put or a tar, and the jobs it
+/// has not reached leave no event.
+pub(crate) async fn drain_jobs(
+    queue: &DebugBundleQueue,
+    mut workers: tokio::sync::oneshot::Receiver<()>,
+    budget: Duration,
+    grace: Duration,
+) -> bool {
+    if tokio::time::timeout(budget, &mut workers).await.is_ok() {
+        return true;
+    }
+    queue.abort();
+    tokio::time::timeout(grace, workers).await.is_ok()
+}
+
+/// The shutdown warning when [`drain_jobs`] found workers still running.
+pub(crate) fn drain_warning(exited: bool) -> Option<String> {
+    (!exited).then(|| {
+        format!(
+            "debug bundle workers did not stop within {} s of shutdown; jobs they had not \
+             reached leave no event",
+            (DRAIN_BUDGET + ABORT_GRACE).as_secs()
+        )
+    })
 }
 
 fn run_worker(
@@ -704,7 +766,8 @@ enum JobOutcome {
     BundleFailed(String),
     /// The put failed; nothing is stored.
     Failed(String),
-    /// The daemon is stopping; nothing is stored.
+    /// The daemon is stopping: the job was queued, or its `dsymutil` was
+    /// still running at the end of [`DRAIN_BUDGET`]. Nothing is stored.
     Dropped,
 }
 
@@ -753,11 +816,14 @@ fn run_job(
 ) -> JobOutcome {
     let crate_name = &job.request.crate_name;
     let started = std::time::Instant::now();
-    if daemon.debug_bundle_queue().is_closing() {
+    let queue = daemon.debug_bundle_queue();
+    if queue.is_closing() {
         return JobOutcome::Dropped;
     }
-    let files = match entry_files(job, dsymutil, timeout) {
+    let files = match entry_files(job, dsymutil, timeout, &queue.aborting) {
         Ok(files) => files,
+        // Killed for the abort, or failed while the daemon stops.
+        Err(_) if queue.is_aborting() => return JobOutcome::Dropped,
         Err(error) => {
             let error = crate::wrapper::store_error_for_event(&error);
             tracing::warn!(
@@ -768,7 +834,7 @@ fn run_job(
             return JobOutcome::BundleFailed(error);
         }
     };
-    if daemon.debug_bundle_queue().is_closing() {
+    if queue.is_aborting() {
         return JobOutcome::Dropped;
     }
     let put = publish(store, &job.request, &files);
@@ -817,7 +883,7 @@ fn write_job_event(
     event.store_error = store_error.to_owned();
     event.daemon_store_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     event.store_handed_off = true;
-    crate::wrapper::write_event(config, &event);
+    crate::wrapper::write_event_waiting(config, &event);
 }
 
 /// The entry's files, `(absolute path, store name)`, the bundle tar among
@@ -827,6 +893,7 @@ fn entry_files(
     job: &DebugBundleJob,
     dsymutil: &DsymutilCommand,
     timeout: Duration,
+    abort: &AtomicBool,
 ) -> Result<Vec<(PathBuf, String)>> {
     let mut files: Vec<(PathBuf, String)> = job
         .request
@@ -834,17 +901,18 @@ fn entry_files(
         .iter()
         .map(|file| (job.dir.join(&file.path), file.store_name.clone()))
         .collect();
-    let tar = build_bundle(job, dsymutil, timeout)?;
+    let tar = build_bundle(job, dsymutil, timeout, abort)?;
     files.push((tar, job.request.bundle_store_name.clone()));
     Ok(files)
 }
 
 /// Run `dsymutil`, place the bundle next to the build's executable, and tar
-/// it. Returns the tar.
+/// it. Returns the tar. `abort` stops `dsymutil` (see [`run_bounded`]).
 fn build_bundle(
     job: &DebugBundleJob,
     dsymutil: &DsymutilCommand,
     timeout: Duration,
+    abort: &AtomicBool,
 ) -> Result<PathBuf> {
     let request = &job.request;
     let executable = job.dir.join(&request.executable);
@@ -862,6 +930,7 @@ fn build_bundle(
         dsymutil(request, &executable, &bundle, &objects),
         &job.dir.join("dsymutil.log"),
         timeout,
+        abort,
     )?;
     let installed = Path::new(&request.installed_executable);
     point_relocations_at(&bundle, &executable, installed)?;
@@ -882,10 +951,19 @@ fn build_bundle(
 }
 
 /// Run `command` to completion within `timeout`, its stderr in `log`. A run
-/// past the timeout is killed. An exit other than success is an error that
+/// past the timeout, or still running when `abort` is set, is killed with
+/// everything it started. An exit other than success is an error that
 /// carries the end of `log`.
-fn run_bounded(mut command: Command, log: &Path, timeout: Duration) -> Result<()> {
+fn run_bounded(
+    mut command: Command,
+    log: &Path,
+    timeout: Duration,
+    abort: &AtomicBool,
+) -> Result<()> {
     let stderr = std::fs::File::create(log).context("creating the dsymutil log")?;
+    // Its own process group, so a kill reaches what it starts as well.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -897,15 +975,18 @@ fn run_bounded(mut command: Command, log: &Path, timeout: Duration) -> Result<()
         if let Some(status) = child.try_wait().context("waiting for dsymutil")? {
             break status;
         }
+        if abort.load(Ordering::Acquire) {
+            kill_and_reap(&mut child);
+            bail!("dsymutil was killed: the daemon is stopping");
+        }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
             bail!(
                 "dsymutil ran longer than {} s and was killed",
                 timeout.as_secs()
             );
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(POLL);
     };
     let output = std::fs::read_to_string(log).unwrap_or_default();
     let output = output.trim();
@@ -917,6 +998,23 @@ fn run_bounded(mut command: Command, log: &Path, timeout: Duration) -> Result<()
         tracing::debug!("dsymutil: {output}");
     }
     Ok(())
+}
+
+/// Kill `child`'s process group, which it leads (see [`run_bounded`]), then
+/// reap it. The group outlives an exited leader until it is reaped, so the
+/// signal cannot reach a group that reused the ID.
+fn kill_and_reap(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(group) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: kill takes plain integers; a negative PID names the group.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// The command the synchronous path runs (`dsymutil <executable> -o

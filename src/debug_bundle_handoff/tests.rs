@@ -951,6 +951,8 @@ fn hanging_dsymutil(_: &PublishRustcDebugRequest, _: &Path, _: &Path, _: &Path) 
 }
 
 const NO_TIMEOUT: Duration = Duration::from_secs(60);
+/// An abort flag that is never set.
+static RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn entry_fields(cache_key: &str) -> EntryFields<'_> {
     EntryFields {
@@ -1041,7 +1043,7 @@ fn a_job_builds_installs_and_tars_the_bundle() {
     // The build rewrites its object after the wrapper returned.
     std::fs::write(fixture.profile.join("deps/a.o"), b"next build").unwrap();
 
-    let files = entry_files(&job, &fake_dsymutil, NO_TIMEOUT).unwrap();
+    let files = entry_files(&job, &fake_dsymutil, NO_TIMEOUT, &RUNNING).unwrap();
     let names: Vec<_> = files.iter().map(|(_, name)| name.as_str()).collect();
     assert_eq!(names, ["demo-1234", "demo-1234.d", "demo-1234.dsym.tar"]);
     assert!(files.iter().all(|(path, _)| path.starts_with(&job.dir)));
@@ -1093,9 +1095,9 @@ fn a_failed_dsymutil_leaves_no_entry_files() {
     let fixture = make_fixture(OBJECTS);
     let config = fixture_config(&fixture);
     let job = accepted_job(&fixture, &config);
-    let error = build_bundle(&job, &failing_dsymutil, NO_TIMEOUT).unwrap_err();
+    let error = build_bundle(&job, &failing_dsymutil, NO_TIMEOUT, &RUNNING).unwrap_err();
     assert!(format!("{error:#}").contains("cannot read"), "{error:#}");
-    let error = entry_files(&job, &failing_dsymutil, NO_TIMEOUT).unwrap_err();
+    let error = entry_files(&job, &failing_dsymutil, NO_TIMEOUT, &RUNNING).unwrap_err();
     assert!(format!("{error:#}").contains("cannot read"), "{error:#}");
     assert!(!fixture.profile.join("deps/demo-1234.dSYM").exists());
 }
@@ -1193,7 +1195,13 @@ fn a_hung_dsymutil_is_killed_at_its_timeout() {
     let config = fixture_config(&fixture);
     let job = accepted_job(&fixture, &config);
     let started = std::time::Instant::now();
-    let error = build_bundle(&job, &hanging_dsymutil, Duration::from_millis(200)).unwrap_err();
+    let error = build_bundle(
+        &job,
+        &hanging_dsymutil,
+        Duration::from_millis(200),
+        &RUNNING,
+    )
+    .unwrap_err();
     assert!(format!("{error:#}").contains("was killed"), "{error:#}");
     assert!(started.elapsed() < Duration::from_secs(20));
 }
@@ -1312,6 +1320,242 @@ fn a_dropped_job_stores_nothing_and_removes_its_directory() {
         events[0].store_error,
         "the daemon stopped before the deferred debug bundle was built"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_job_running_when_the_queue_closes_still_stores_its_entry() {
+    let fixture = make_fixture(OBJECTS);
+    let config = fixture_config(&fixture);
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let store = Store::open(&config).unwrap();
+    let job = accepted_job_with_event(&fixture, &config);
+    // The daemon starts to stop while this job's `dsymutil` runs.
+    let stopping = Arc::clone(&daemon);
+    let closing = move |request: &PublishRustcDebugRequest,
+                        executable: &Path,
+                        bundle: &Path,
+                        objects: &Path| {
+        stopping.debug_bundle_queue().close();
+        fake_dsymutil(request, executable, bundle, objects)
+    };
+    assert_eq!(
+        process_job(&daemon, &config, &store, job, &closing, NO_TIMEOUT),
+        JobOutcome::Stored
+    );
+    assert!(daemon.debug_bundle_queue().is_closing());
+    assert!(store.get(&key("demo")).unwrap().is_some());
+    assert_eq!(logged_events(&config)[0].store_error, "");
+}
+
+/// One of the stand-in `dsymutil` commands above.
+#[cfg(unix)]
+type FakeDsymutil = fn(&PublishRustcDebugRequest, &Path, &Path, &Path) -> Command;
+
+#[cfg(unix)]
+#[test]
+fn an_abort_kills_a_running_dsymutil_and_drops_its_job() {
+    let fixture = make_fixture(OBJECTS);
+    let config = fixture_config(&fixture);
+    let store = Store::open(&config).unwrap();
+    // The drain budget runs out while `dsymutil` runs: a hung one, and one
+    // that may exit before the worker sees the abort. Neither job stores.
+    let dsymutils: [FakeDsymutil; 2] = [hanging_dsymutil, fake_dsymutil];
+    for dsymutil in dsymutils {
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let stopping = Arc::clone(&daemon);
+        let aborting = move |request: &PublishRustcDebugRequest,
+                             executable: &Path,
+                             bundle: &Path,
+                             objects: &Path| {
+            stopping.debug_bundle_queue().abort();
+            dsymutil(request, executable, bundle, objects)
+        };
+        let job = accepted_job_with_event(&fixture, &config);
+        let job_dir = job.dir.clone();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            process_job(&daemon, &config, &store, job, &aborting, NO_TIMEOUT),
+            JobOutcome::Dropped
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(!job_dir.exists());
+    }
+    assert!(store.get(&key("demo")).unwrap().is_none());
+    let events = logged_events(&config);
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.store_error == JobOutcome::Dropped.store_error()),
+        "{events:?}"
+    );
+}
+
+/// The PIDs a [`recording_dsymutil`] wrote. A test that fails kills them, so
+/// it leaves no sleeper behind.
+#[cfg(unix)]
+struct RecordedPids(PathBuf);
+
+#[cfg(unix)]
+impl RecordedPids {
+    fn read(&self) -> Vec<libc::pid_t> {
+        std::fs::read_to_string(&self.0)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|pid| pid.parse().ok())
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RecordedPids {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            for pid in self.read() {
+                // SAFETY: kill takes plain integers.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+/// Whether no process `pid` exists, not even one waiting to be reaped.
+#[cfg(unix)]
+fn gone(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    let signalled = unsafe { libc::kill(pid, 0) };
+    signalled == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// A `dsymutil` script that starts a child of its own, records its PID and
+/// the child's in `pids`, and waits for the child.
+#[cfg(unix)]
+fn recording_dsymutil(dir: &Path, pids: &Path) -> PathBuf {
+    let script = dir.join("dsymutil");
+    kache_fs::testutil::write_executable(
+        &script,
+        format!(
+            "#!/bin/sh\n{} 60 &\necho \"$$ $!\" >> '{}'\nwait\n",
+            option_env!("KACHE_TEST_SLEEP").unwrap_or("/bin/sleep"),
+            pids.display()
+        ),
+    );
+    script
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_kills_running_dsymutils_and_drops_queued_jobs_with_their_events() {
+    let fixture = make_fixture(OBJECTS);
+    let config = fixture_config(&fixture);
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let scratch = tempfile::tempdir().unwrap();
+    let pids = RecordedPids(scratch.path().join("pids"));
+    let script = recording_dsymutil(scratch.path(), &pids.0);
+    let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+    let workers = spawn_workers(Arc::clone(&daemon), rx).unwrap();
+    let jobs = WORKERS + 2;
+    for _ in 0..jobs {
+        let mut job = accepted_job_with_event(&fixture, &config);
+        job.request.dsymutil = script.to_string_lossy().into_owned();
+        assert!(tx.send(job).await.is_ok(), "the workers hold the receiver");
+    }
+    drop(tx);
+    // Every worker is in its `dsymutil`; the other jobs wait in the queue.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while pids.read().len() < 2 * WORKERS {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the workers did not start dsymutil"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    daemon.debug_bundle_queue().close();
+    let started = std::time::Instant::now();
+    assert!(
+        drain_jobs(
+            daemon.debug_bundle_queue(),
+            workers,
+            Duration::from_millis(100),
+            Duration::from_secs(20),
+        )
+        .await,
+        "the workers exit once their dsymutil is killed"
+    );
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(daemon.debug_bundle_queue().is_aborting());
+    let recorded = pids.read();
+    assert_eq!(recorded.len(), 2 * WORKERS, "queued jobs start no dsymutil");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !recorded.iter().all(|pid| gone(*pid)) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a dsymutil or a process it started outlived the stop: {recorded:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let events = logged_events(&config);
+    assert_eq!(events.len(), jobs, "{events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.store_error == JobOutcome::Dropped.store_error()),
+        "{events:?}"
+    );
+    assert!(
+        fixture
+            .staging_dirs()
+            .iter()
+            .all(|name| !name.starts_with(JOB_PREFIX)),
+        "{:?}",
+        fixture.staging_dirs()
+    );
+    assert!(
+        Store::open(&config)
+            .unwrap()
+            .get(&key("demo"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_drain_aborts_only_workers_that_outlast_its_budget() {
+    let queue = DebugBundleQueue::new();
+    let (running, workers) = tokio::sync::oneshot::channel::<()>();
+    drop(running);
+    assert!(
+        drain_jobs(
+            &queue,
+            workers,
+            Duration::from_secs(30),
+            Duration::from_secs(30)
+        )
+        .await
+    );
+    assert!(
+        !queue.is_aborting(),
+        "workers that exit in time are not aborted"
+    );
+
+    let (running, workers) = tokio::sync::oneshot::channel::<()>();
+    let budget = Duration::from_millis(50);
+    assert!(!drain_jobs(&queue, workers, budget, budget).await);
+    assert!(queue.is_aborting());
+    assert!(queue.is_closing(), "an abort also closes the queue");
+    drop(running);
+}
+
+#[test]
+fn only_workers_left_running_at_shutdown_warn() {
+    assert_eq!(drain_warning(true), None);
+    let warning = drain_warning(false).unwrap();
+    assert!(warning.contains("within 12 s"), "{warning}");
 }
 
 #[cfg(unix)]
@@ -1451,7 +1695,7 @@ fn a_deferred_bundle_matches_the_synchronous_one_and_resolves_lines() {
     let dir = take_staging(&handoff_dir(&config), &capture.dir).unwrap();
     let job = DebugBundleJob { request, dir, uuid };
 
-    let deferred_tar = build_bundle(&job, &dsymutil_command, NO_TIMEOUT).unwrap();
+    let deferred_tar = build_bundle(&job, &dsymutil_command, NO_TIMEOUT, &RUNNING).unwrap();
     assert_eq!(
         std::fs::read(&deferred_tar).unwrap(),
         std::fs::read(&sync_tar).unwrap(),
