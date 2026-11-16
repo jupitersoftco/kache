@@ -637,6 +637,12 @@ pub(crate) fn remove_abandoned_jobs(config: &Config) -> usize {
     removed
 }
 
+/// The startup note for `removed` job directories a previous daemon left, or
+/// `None` when it left none.
+pub(crate) fn abandoned_jobs_note(removed: usize) -> Option<String> {
+    (removed > 0).then(|| format!("removed {removed} debug bundle jobs a previous daemon left"))
+}
+
 /// Start the workers. Each has its own store connection and runs one job
 /// at a time; they share the queue. The receiver resolves once every worker
 /// has exited, after [`DebugBundleQueue::close`] and the queue's last job:
@@ -994,9 +1000,7 @@ fn run_bounded(
         let tail = &output[output.len().saturating_sub(4096)..];
         bail!("dsymutil exited with {status}: {tail}");
     }
-    if !output.is_empty() {
-        tracing::debug!("dsymutil: {output}");
-    }
+    tracing::debug!("dsymutil: {output}");
     Ok(())
 }
 

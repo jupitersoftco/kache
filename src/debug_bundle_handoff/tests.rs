@@ -661,6 +661,9 @@ fn non_ascii_paths_are_matched_and_written_double_quoted() {
 #[test]
 fn values_are_quoted_as_llvm_quotes_them() {
     assert_eq!(yaml_scalar("/a/b"), "'/a/b'");
+    // Space, 0x20, is the first byte past the control characters.
+    assert_eq!(yaml_scalar("/a b"), "'/a b'");
+    assert_eq!(yaml_scalar("/a\x1f"), "\"/a\\x1F\"");
     assert_eq!(yaml_scalar("/a/it's"), "'/a/it''s'");
     assert_eq!(yaml_scalar("/a\tb"), "'/a\tb'");
     assert_eq!(yaml_scalar("/a\nb"), "'/a\nb'");
@@ -1549,6 +1552,70 @@ async fn a_drain_aborts_only_workers_that_outlast_its_budget() {
     assert!(queue.is_aborting());
     assert!(queue.is_closing(), "an abort also closes the queue");
     drop(running);
+}
+
+#[test]
+fn only_a_daemon_that_left_jobs_behind_notes_their_removal() {
+    assert_eq!(abandoned_jobs_note(0), None);
+    assert_eq!(
+        abandoned_jobs_note(1).as_deref(),
+        Some("removed 1 debug bundle jobs a previous daemon left")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn without_a_daemon_socket_nothing_is_captured() {
+    let fixture = make_fixture(OBJECTS);
+    let config = fixture_config(&fixture);
+    assert!(!config.socket_path().exists());
+    let cache_key = key("demo");
+    assert_eq!(
+        hand_off(
+            &config,
+            &entry_fields(&cache_key),
+            &fixture.files(),
+            &fixture.linked()
+        ),
+        Handoff::Declined("no daemon socket".to_string())
+    );
+    assert!(
+        fixture.staging_dirs().is_empty(),
+        "{:?}",
+        fixture.staging_dirs()
+    );
+}
+
+/// Only a stored job the wrapper marked for the remote queues an upload,
+/// and only when a remote is configured.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_job_marked_for_the_remote_queues_its_upload() {
+    for marked in [false, true] {
+        let fixture = make_fixture(OBJECTS);
+        let mut config = fixture_config(&fixture);
+        config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (upload_tx, mut uploads) = tokio::sync::mpsc::unbounded_channel();
+        daemon.set_upload_tx(upload_tx);
+        let mut job = accepted_job(&fixture, &config);
+        job.request.publishes_to_remote = marked;
+        let worker = Arc::clone(&daemon);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let store = Store::open(&config).unwrap();
+            process_job(&worker, &config, &store, job, &fake_dsymutil, NO_TIMEOUT)
+        })
+        .await
+        .unwrap();
+        assert_eq!(outcome, JobOutcome::Stored);
+        match uploads.try_recv() {
+            Ok(queued) => {
+                assert!(marked, "a local-only entry was queued");
+                assert_eq!(queued.key, key("demo"));
+            }
+            Err(_) => assert!(!marked, "the marked entry was not queued"),
+        }
+    }
 }
 
 #[test]
