@@ -45,12 +45,15 @@ pub(crate) fn lock_for_build(
 fn recent_bytes(path: &Path) -> Result<Vec<u8>> {
     let lock = open_log_lock(path)?;
     lock.try_lock_shared()?;
-    let mut file = File::open(path)?;
-    let len = file.metadata()?.len();
-    let start = len.saturating_sub(RECENT_BYTES);
-    file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::new();
-    file.take(RECENT_BYTES).read_to_end(&mut bytes)?;
+    let (start, mut bytes) = unlock_after(&lock, "event log", || {
+        let mut file = File::open(path)?;
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(RECENT_BYTES);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(RECENT_BYTES).read_to_end(&mut bytes)?;
+        Ok((start, bytes))
+    })?;
     if start != 0 {
         // The snapshot may start in the middle of a record or UTF-8 sequence.
         let end = bytes

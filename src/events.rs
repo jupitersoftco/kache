@@ -180,6 +180,16 @@ fn append_log_line(event_log_path: &Path, line: String, lock_mode: LogLock) -> R
     write_result
 }
 
+/// Run `body` under `lock`, then release it with an explicit unlock, also
+/// when `body` fails. Dropping the descriptor is not enough: a child another
+/// thread forks meanwhile holds a copy of it until it execs, and the lock
+/// stays held while any copy is open. An unlock releases it for all copies.
+fn unlock_after<T>(lock: &File, log: &str, body: impl FnOnce() -> Result<T>) -> Result<T> {
+    let result = body();
+    lock.unlock().with_context(|| format!("unlocking {log}"))?;
+    result
+}
+
 /// Append one JSON record to a JSONL log under the same exclusive sidecar lock
 /// as the event log, for logs outside the event, summary and transfer set such
 /// as the machine-level session records in the cache dir.
@@ -299,24 +309,23 @@ pub fn read_events_and<T>(
 
     let lock = open_log_lock(event_log_path).context("opening event log lock")?;
     lock.lock_shared().context("locking event log for read")?;
+    unlock_after(&lock, "event log", || {
+        let file = File::open(event_log_path).context("opening event log")?;
+        let reader = BufReader::new(&file);
+        let mut events = Vec::new();
 
-    let file = File::open(event_log_path).context("opening event log")?;
-    let reader = BufReader::new(&file);
-    let mut events = Vec::new();
-
-    for line in reader.split(b'\n') {
-        let line = line?;
-        match serde_json::from_slice::<BuildEvent>(&line) {
-            Ok(event) => events.push(event),
-            Err(e) => {
-                tracing::debug!("skipping invalid event line: {}", e);
+        for line in reader.split(b'\n') {
+            let line = line?;
+            match serde_json::from_slice::<BuildEvent>(&line) {
+                Ok(event) => events.push(event),
+                Err(e) => {
+                    tracing::debug!("skipping invalid event line: {}", e);
+                }
             }
         }
-    }
 
-    let extra = also();
-    lock.unlock().context("unlocking event log")?;
-    Ok((events, extra))
+        Ok((events, also()))
+    })
 }
 
 /// Read events since a given timestamp: the archived segments a rotation
@@ -1154,25 +1163,25 @@ fn append_summary(summary_log_path: &Path, event: &BuildSummaryEvent, durable: b
     }
     let lock = open_log_lock(summary_log_path).context("opening summary log lock")?;
     lock.lock().context("locking summary log")?;
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(summary_log_path)
-        .context("opening summary log")?;
-    let line = serde_json::to_string(event).context("serializing summary event")?;
-    let mut bytes = line.into_bytes();
-    bytes.push(b'\n');
-    file.write_all(&bytes)
-        .context("writing summary event to log")?;
-    if durable {
-        file.sync_all().context("flushing summary event to disk")?;
-        if let Some(parent) = summary_log_path.parent() {
-            crate::atomic::fsync_dir(parent).context("flushing summary directory")?;
+    unlock_after(&lock, "summary log", || {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(summary_log_path)
+            .context("opening summary log")?;
+        let line = serde_json::to_string(event).context("serializing summary event")?;
+        let mut bytes = line.into_bytes();
+        bytes.push(b'\n');
+        file.write_all(&bytes)
+            .context("writing summary event to log")?;
+        if durable {
+            file.sync_all().context("flushing summary event to disk")?;
+            if let Some(parent) = summary_log_path.parent() {
+                crate::atomic::fsync_dir(parent).context("flushing summary directory")?;
+            }
         }
-    }
-    lock.unlock().context("unlocking summary log")?;
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Read all build summaries from the summary log. Invalid lines are skipped
@@ -1183,25 +1192,24 @@ pub fn read_summaries(summary_log_path: &Path) -> Result<Vec<BuildSummaryEvent>>
     }
     let lock = open_log_lock(summary_log_path).context("opening summary log lock")?;
     lock.lock_shared().context("locking summary log for read")?;
-
-    let file = File::open(summary_log_path).context("opening summary log")?;
-    let reader = BufReader::new(&file);
-    let mut events = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<BuildSummaryEvent>(&line) {
-            Ok(event) => events.push(event),
-            Err(e) => {
-                tracing::debug!("skipping invalid summary line: {}", e);
+    unlock_after(&lock, "summary log", || {
+        let file = File::open(summary_log_path).context("opening summary log")?;
+        let reader = BufReader::new(&file);
+        let mut events = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<BuildSummaryEvent>(&line) {
+                Ok(event) => events.push(event),
+                Err(e) => {
+                    tracing::debug!("skipping invalid summary line: {}", e);
+                }
             }
         }
-    }
-
-    lock.unlock().context("unlocking summary log")?;
-    Ok(events)
+        Ok(events)
+    })
 }
 
 // ── Transfer log ────────────────────────────────────────────────────────────
@@ -1215,19 +1223,18 @@ pub fn log_transfer(transfer_log_path: &Path, event: &TransferEvent) -> Result<(
     }
     let lock = open_log_lock(transfer_log_path).context("opening transfer log lock")?;
     lock.lock().context("locking transfer log")?;
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(transfer_log_path)
-        .context("opening transfer log")?;
-    let line = serde_json::to_string(event).context("serializing transfer event")?;
-    let mut bytes = line.into_bytes();
-    bytes.push(b'\n');
-    file.write_all(&bytes)
-        .context("writing transfer event to log")?;
-    lock.unlock().context("unlocking transfer log")?;
-    Ok(())
+    unlock_after(&lock, "transfer log", || {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(transfer_log_path)
+            .context("opening transfer log")?;
+        let line = serde_json::to_string(event).context("serializing transfer event")?;
+        let mut bytes = line.into_bytes();
+        bytes.push(b'\n');
+        file.write_all(&bytes)
+            .context("writing transfer event to log")
+    })
 }
 
 /// Read all transfer events from the transfer log.
@@ -1238,24 +1245,24 @@ pub fn read_transfers(transfer_log_path: &Path) -> Result<Vec<TransferEvent>> {
     let lock = open_log_lock(transfer_log_path).context("opening transfer log lock")?;
     lock.lock_shared()
         .context("locking transfer log for read")?;
-
-    let file = File::open(transfer_log_path).context("opening transfer log")?;
-    let reader = BufReader::new(&file);
-    let mut events = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<TransferEvent>(&line) {
-            Ok(event) => events.push(event),
-            Err(e) => {
-                tracing::debug!("skipping invalid transfer line: {}", e);
+    unlock_after(&lock, "transfer log", || {
+        let file = File::open(transfer_log_path).context("opening transfer log")?;
+        let reader = BufReader::new(&file);
+        let mut events = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<TransferEvent>(&line) {
+                Ok(event) => events.push(event),
+                Err(e) => {
+                    tracing::debug!("skipping invalid transfer line: {}", e);
+                }
             }
         }
-    }
-    lock.unlock().context("unlocking transfer log")?;
-    Ok(events)
+        Ok(events)
+    })
 }
 
 fn open_log_lock(log_path: &Path) -> Result<File> {
@@ -1498,6 +1505,32 @@ pub fn compute_stats_onto(mut stats: EventStats, events: &[BuildEvent]) -> Event
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_lock_is_released_while_a_copy_of_its_descriptor_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let lock = open_log_lock(&log).unwrap();
+        // What a child forked while the lock is held inherits.
+        let copy = lock.try_clone().unwrap();
+        let other = open_log_lock(&log).unwrap();
+
+        lock.lock_shared().unwrap();
+        assert_eq!(unlock_after(&lock, "event log", || Ok(7)).unwrap(), 7);
+        other
+            .try_lock()
+            .expect("released while the copy is still open");
+        other.unlock().unwrap();
+
+        lock.lock_shared().unwrap();
+        let error = unlock_after(&lock, "event log", || -> Result<()> {
+            anyhow::bail!("read failed")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "read failed");
+        other.try_lock().expect("a failed read releases it too");
+        drop(copy);
+    }
 
     // Linux rejects fsync on a FIFO; macOS accepts it without an error.
     #[cfg(target_os = "linux")]
