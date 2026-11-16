@@ -40,6 +40,13 @@ fn only_unpacked_debug_info_on_macos_under_deferred_is_wanted() {
 }
 
 #[test]
+fn a_default_configuration_defers_a_macos_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    assert!(wanted(config.macos_debug_bundle, "macos", Some("unpacked")));
+}
+
+#[test]
 fn only_relative_objects_and_sysroot_rlibs_are_accepted() {
     let sysroot = Some(Path::new("/toolchain"));
     assert_eq!(

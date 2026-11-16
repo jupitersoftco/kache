@@ -5,16 +5,17 @@
 > **Why the fork exists:** on macOS, Kache stores each linked executable with a relocatable `.dSYM`.
 > Upstream builds that bundle (`dsymutil` plus a tar) synchronously, before rustc returns to Cargo.
 > For a large test harness that adds about 10 s to every edit-and-rebuild.
-> This fork adds `cache.macos_debug_bundle = "deferred"` (env `KACHE_MACOS_DEBUG_BUNDLE`).
-> With it, the daemon builds and stores the bundle in the background after the build returns.
-> Cache keys and stored entries are the same as with the default `"sync"`.
+> This fork adds `cache.macos_debug_bundle = "deferred"` (env `KACHE_MACOS_DEBUG_BUNDLE`), and makes it the default.
+> The daemon builds and stores the bundle in the background after the build returns.
+> Cache keys and stored entries are the same as with upstream's `"sync"`.
 > Until the daemon installs the bundle (usually well under a second; longer for very large binaries), a freshly
 > linked executable's backtraces and lldb sessions have no file:line information.
 > If the daemon cannot take the bundle (for example its queue is full) or `dsymutil` fails, that executable is
 > simply not cached: no `dsymutil` runs on Cargo's critical path, and no executable is stored without its bundle.
 > Such an executable gets no `.dSYM` until its next link. Its debug map is relative to Cargo's profile directory
 > (Kache links with `-oso_prefix`), so lldb resolves its file:line only when started from that directory.
-> The default stays `"sync"`, so behavior is unchanged unless you opt in.
+> To get upstream's behavior back, set `macos_debug_bundle = "sync"` under `[cache]` or `KACHE_MACOS_DEBUG_BUNDLE=sync`:
+> `dsymutil` then runs before rustc returns, and the `.dSYM` is there when the build does.
 > The change is on the `deferred-debug-bundle` branch and in the commit history.
 > All other code is upstream's, under the same Apache-2.0 license (see `LICENSE`).
 > It may be offered upstream after wider validation.
