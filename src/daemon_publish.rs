@@ -1558,7 +1558,10 @@ mod tests {
             run_publish_worker(worker_daemon, rx);
             let _ = done_tx.send(());
         });
-        let drain = crate::daemon::drain_publications_then_close_uploads(&daemon, done);
+        // No debug bundle workers: their receiver resolves at once.
+        let (_, no_bundle_workers) = tokio::sync::oneshot::channel();
+        let drain =
+            crate::daemon::drain_publications_then_close_uploads(&daemon, done, no_bundle_workers);
         tokio::pin!(drain);
         // Let shutdown close publication admission before the worker can
         // publish. Poll once so the fixture needs no scheduling delay.

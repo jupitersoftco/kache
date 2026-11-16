@@ -9866,8 +9866,23 @@ pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
 /// Append `event` to the event log and rotate the logs. Best-effort: nothing
 /// here may fail a build.
 pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
+    write_event_with(config, event, events::log_event_for_build);
+}
+
+/// [`write_event`] for a daemon worker, which no build waits on: it waits
+/// for the event log's lock rather than drop the event when the lock is
+/// busy. The event is the only record of how a handed-off compile ended.
+pub(crate) fn write_event_waiting(config: &Config, event: &BuildEvent) {
+    write_event_with(config, event, events::append_json_line);
+}
+
+fn write_event_with(
+    config: &Config,
+    event: &BuildEvent,
+    log: fn(&Path, &BuildEvent) -> anyhow::Result<()>,
+) {
     let _trace = crate::phase_trace::phase("event_log");
-    if let Err(error) = events::log_event_for_build(&config.event_log_path(), event) {
+    if let Err(error) = log(&config.event_log_path(), event) {
         tracing::debug!(crate_name = %event.crate_name, "could not record compiler event: {error:#}");
         return;
     }

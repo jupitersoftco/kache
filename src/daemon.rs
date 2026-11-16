@@ -7125,7 +7125,8 @@ fn publish_drain_warning(unpublished: usize) -> Option<String> {
 }
 
 /// Drain accepted publications until the worker finishes or stops making
-/// progress, then close the upload queue.
+/// progress, and debug bundle jobs within their budget (see
+/// [`crate::debug_bundle_handoff::drain_jobs`]), then close the upload queue.
 ///
 /// Accepted hand-offs hold their key locks. The worker keeps going for as long
 /// as it makes progress: a job it never reaches is an entry the next build
@@ -7135,17 +7136,28 @@ fn publish_drain_warning(unpublished: usize) -> Option<String> {
 pub(crate) async fn drain_publications_then_close_uploads(
     daemon: &Daemon,
     publish_done: tokio::sync::oneshot::Receiver<()>,
+    debug_bundle_workers: tokio::sync::oneshot::Receiver<()>,
 ) {
     daemon.publish_queue().close();
     daemon.debug_bundle_queue().close();
     let publish_progress = daemon.publish_queue().progress();
-    let unpublished = crate::daemon_publish::drain_publications(
-        publish_done,
-        &publish_progress,
-        crate::daemon_publish::PUBLISH_DRAIN_STALL,
-    )
-    .await;
+    let (unpublished, bundles_drained) = tokio::join!(
+        crate::daemon_publish::drain_publications(
+            publish_done,
+            &publish_progress,
+            crate::daemon_publish::PUBLISH_DRAIN_STALL,
+        ),
+        crate::debug_bundle_handoff::drain_jobs(
+            daemon.debug_bundle_queue(),
+            debug_bundle_workers,
+            crate::debug_bundle_handoff::DRAIN_BUDGET,
+            crate::debug_bundle_handoff::ABORT_GRACE,
+        ),
+    );
     if let Some(warning) = publish_drain_warning(unpublished) {
+        tracing::warn!("{warning}");
+    }
+    if let Some(warning) = crate::debug_bundle_handoff::drain_warning(bundles_drained) {
         tracing::warn!("{warning}");
     }
     // Graceful shutdown: drop the daemon's sender to close the unbounded buffer.
@@ -7157,8 +7169,9 @@ pub(crate) async fn drain_publications_then_close_uploads(
 }
 
 /// Deferred debug bundles (see `debug_bundle_handoff`): job directories left
-/// by a daemon that stopped are removed before this one accepts jobs.
-fn start_debug_bundle_workers(daemon: &Arc<Daemon>) -> Result<()> {
+/// by a daemon that crashed are removed before this one accepts jobs. The
+/// receiver resolves once the workers have exited.
+fn start_debug_bundle_workers(daemon: &Arc<Daemon>) -> Result<tokio::sync::oneshot::Receiver<()>> {
     let removed = crate::debug_bundle_handoff::remove_abandoned_jobs(daemon.config());
     if removed > 0 {
         tracing::info!("removed {removed} debug bundle jobs a previous daemon left");
@@ -7286,7 +7299,7 @@ async fn server_main(
     daemon.publish_queue().set_sender(publish_tx);
     let publish_done = crate::daemon_publish::spawn_publish_worker(daemon.clone(), publish_rx)
         .context("starting the publish worker")?;
-    start_debug_bundle_workers(&daemon)?;
+    let debug_bundle_workers = start_debug_bundle_workers(&daemon)?;
 
     // Periodic GC task: run immediately on startup, then every 6 hours
     let gc_daemon = daemon.clone();
@@ -7496,7 +7509,7 @@ async fn server_main(
     heartbeat_handle.abort();
     config_watch_handle.abort();
 
-    drain_publications_then_close_uploads(&daemon, publish_done).await;
+    drain_publications_then_close_uploads(&daemon, publish_done, debug_bundle_workers).await;
     drop(daemon);
     if drain_upload_pipeline(
         enqueue_handle,
