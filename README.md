@@ -1,5 +1,5 @@
 > [!NOTE]
-> **Unofficial fork** of [kunobi-ninja/kache](https://github.com/kunobi-ninja/kache), kept rebased on upstream `main`.
+> **Unofficial fork** of [kunobi-ninja/kache](https://github.com/kunobi-ninja/kache), kept up to date with upstream `main` by regular merges.
 > Not affiliated with or endorsed by Kunobi. Use upstream unless you need the changes below.
 
 <details>
@@ -23,7 +23,7 @@ which adds about 10 s to every edit-and-rebuild of a large test harness. Here th
 - Compiler probes run once per key across concurrent callers.
 - The process-liveness test fixture works on macOS 26, which kills copied platform binaries.
 
-Each change is a separate commit on top of upstream, so `git log upstream/main..main` lists exactly what differs.
+Each change is its own commit, so `git log --no-merges upstream/main..main` lists exactly what differs.
 Everything else is upstream's code, under the same Apache-2.0 license (see `LICENSE`).
 
 </details>
