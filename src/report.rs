@@ -419,6 +419,11 @@ pub struct ReportSummary {
     pub time_saved_ms: u64,
     pub total_crates: usize,
     pub local_hits: usize,
+    /// Local hits restored from `[cache] readonly_store`. Part of
+    /// `local_hits`, not added to it. Zero in reports written before this
+    /// field existed and for events logged before event schema 28.
+    #[serde(default)]
+    pub readonly_hits: usize,
     pub prefetch_hits: usize,
     pub remote_hits: usize,
     #[serde(default)]
@@ -772,6 +777,57 @@ pub struct PrefetchAnalysis {
     pub contribution_pct: f64,
 }
 
+/// First private compiles by how they looked for another checkout's
+/// incremental state. Compile times count successful compiles only.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedSummary {
+    pub imported: usize,
+    pub no_donor: usize,
+    pub unportable: usize,
+    pub seeded_compiles: usize,
+    pub seeded_compile_ms: u64,
+    pub unseeded_compiles: usize,
+    pub unseeded_compile_ms: u64,
+}
+
+impl SeedSummary {
+    pub fn looked(&self) -> usize {
+        self.imported + self.no_donor + self.unportable
+    }
+}
+
+pub(crate) fn seed_summary(events: &[BuildEvent]) -> SeedSummary {
+    let mut summary = SeedSummary::default();
+    for event in events {
+        let seeded = match event.incremental_seed_attempt.as_str() {
+            "imported" => {
+                summary.imported += 1;
+                true
+            }
+            "no-donor" => {
+                summary.no_donor += 1;
+                false
+            }
+            "unportable" => {
+                summary.unportable += 1;
+                false
+            }
+            _ => continue,
+        };
+        if event.exit_code != Some(0) {
+            continue;
+        }
+        if seeded {
+            summary.seeded_compiles += 1;
+            summary.seeded_compile_ms += event.compile_time_ms;
+        } else {
+            summary.unseeded_compiles += 1;
+            summary.unseeded_compile_ms += event.compile_time_ms;
+        }
+    }
+    summary
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BypassAnalysis {
     pub passthroughs: usize,
@@ -792,6 +848,10 @@ pub struct BypassAnalysis {
     /// Wrapper time of `uncached_compiles`.
     #[serde(default)]
     pub uncached_compile_time_ms: u64,
+    /// First private compiles that looked for another checkout's
+    /// incremental state.
+    #[serde(default)]
+    pub seeds: SeedSummary,
     pub skipped: usize,
     pub fallbacks: usize,
     pub direct_passthroughs: usize,
@@ -1369,6 +1429,7 @@ pub fn generate_report_with_filter(
             time_saved_ms: stats.hit_compile_time_ms,
             total_crates: total_cacheable,
             local_hits: stats.local_hits,
+            readonly_hits: stats.readonly_hits,
             prefetch_hits: stats.prefetch_hits,
             remote_hits: stats.remote_hits,
             dups: stats.dups,
@@ -1998,6 +2059,7 @@ pub(crate) fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> Bypass
         edit_rebuilds,
         uncached_compiles,
         uncached_compile_time_ms,
+        seeds: seed_summary(events),
         skipped,
         fallbacks,
         direct_passthroughs,
@@ -2744,6 +2806,30 @@ fn bypass_total(bypass: &BypassAnalysis) -> usize {
     bypass.passthroughs + bypass.probes + bypass.skipped
 }
 
+/// `("3 of 10", "seeded from another checkout; ...")`, or `None` when no
+/// first private compile looked for a donor.
+fn format_seed_summary(seeds: &SeedSummary) -> Option<(String, String)> {
+    let looked = seeds.looked();
+    if looked == 0 {
+        return None;
+    }
+    let mut note = "seeded from another checkout".to_string();
+    if seeds.unportable > 0 {
+        note.push_str(&format!(", {} not portable", seeds.unportable));
+    }
+    if seeds.seeded_compiles > 0 && seeds.unseeded_compiles > 0 {
+        // Observational: the two groups can hold different crates.
+        note.push_str(&format!(
+            "; mean successful compile {} seeded (n={}), {} without (n={})",
+            crate::term::duration_ms(seeds.seeded_compile_ms / seeds.seeded_compiles as u64),
+            seeds.seeded_compiles,
+            crate::term::duration_ms(seeds.unseeded_compile_ms / seeds.unseeded_compiles as u64),
+            seeds.unseeded_compiles,
+        ));
+    }
+    Some((format!("{} of {looked}", seeds.imported), note))
+}
+
 fn format_bypass_summary(bypass: &BypassAnalysis) -> String {
     let mut parts = Vec::new();
     if bypass.edit_rebuilds > 0 {
@@ -3349,6 +3435,12 @@ pub fn format_markdown(report: &BuildReport) -> String {
         "| Hits | {} (local: {}, prefetch: {}, remote: {}) |",
         total_hits, s.local_hits, s.prefetch_hits, s.remote_hits
     ));
+    if s.readonly_hits > 0 {
+        lines.push(format!(
+            "| Read-only store hits | {} (included in local) |",
+            s.readonly_hits
+        ));
+    }
     if s.dups > 0 {
         lines.push(format!("| Dups | {} |", s.dups));
     }
@@ -3367,6 +3459,9 @@ pub fn format_markdown(report: &BuildReport) -> String {
             "| Passthroughs / skipped | {} |",
             format_bypass_summary(&report.bypass)
         ));
+    }
+    if let Some((count, note)) = format_seed_summary(&report.bypass.seeds) {
+        lines.push(format!("| Worktree seeds | {count} {note} |"));
     }
     lines.push(String::new());
 
@@ -4220,6 +4315,16 @@ pub fn format_text(report: &BuildReport) -> String {
             "compiling on misses".into(),
         ));
     }
+    if s.readonly_hits > 0 {
+        summary.push((
+            "Read-only",
+            term::count(s.readonly_hits as u64),
+            format!(
+                "of {} local hits from the read-only store",
+                term::count(s.local_hits as u64)
+            ),
+        ));
+    }
     if s.dups > 0 {
         summary.push((
             "Duplicates",
@@ -4243,6 +4348,9 @@ pub fn format_text(report: &BuildReport) -> String {
             format_bypass_summary(&report.bypass),
             String::new(),
         ));
+    }
+    if let Some((count, note)) = format_seed_summary(&report.bypass.seeds) {
+        summary.push(("Worktree seeds", count, note));
     }
 
     let mut network = Vec::new();

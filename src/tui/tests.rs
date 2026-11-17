@@ -1513,6 +1513,7 @@ fn sample_build_event(
         store_error: String::new(),
         store_handed_off: false,
         incremental_seed: String::new(),
+        incremental_seed_attempt: String::new(),
         daemon_store_ms: 0,
         lookup_rejection: String::new(),
         verify_compare: String::new(),
@@ -1529,6 +1530,7 @@ fn sample_build_event(
         miss_reason: events::MissReason::None,
         object_output: String::new(),
         package: String::new(),
+        readonly_store: false,
     }
 }
 
@@ -3371,6 +3373,7 @@ fn event_stats(
 ) -> daemon::EventStatsResponse {
     daemon::EventStatsResponse {
         local_hits,
+        readonly_hits: 0,
         prefetch_hits,
         remote_hits,
         dups,
