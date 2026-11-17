@@ -96,6 +96,11 @@ pub(crate) struct Lease {
 /// Scratch for a deferred seed's graph. No lease reuses it, so rustc may
 /// write there before the in-flight record is durable.
 const DEFERRED_GRAPH: &str = "rustc.deferred";
+/// A copy of the dep-info of the last build that went through the cache. A
+/// return to that build is judged by the files it read: the last private
+/// compile's dep-info lacks any a branch switch adds back. A state without
+/// this copy, such as one an older Kache wrote, never looks a return up.
+const CACHED_DEP_INFO: &str = "cached-sources.d";
 
 struct DeferredGraph {
     marker_flush: std::thread::JoinHandle<bool>,
@@ -226,8 +231,9 @@ struct DiskState {
     active_leases: u8,
     last_used_secs: u64,
     in_flight: bool,
-    /// [`AdaptiveUnit::source_set_digest`] of the last build that went
-    /// through the cache, so an active unit returning to it looks it up.
+    /// The source digest of the last build that went through the cache, over
+    /// the files its dep-info names ([`CACHED_DEP_INFO`]), so an active unit
+    /// returning to it looks it up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cached_sources: Option<String>,
     /// The same digest at the unit's last private compile. Sources that did
@@ -387,14 +393,10 @@ impl AdaptiveUnit {
         Some(hash.finalize().to_hex().to_string())
     }
 
-    /// Content digest of the sources the unit's dep-info names. It only
-    /// decides whether an active unit looks up the cache; it never keys one.
-    fn source_set_digest(&self) -> Option<String> {
-        let dep_info = File::open(self.dep_info.as_ref()?).ok()?;
-        if dep_info.metadata().ok()?.len() > MAX_DEP_INFO_BYTES {
-            return None;
-        }
-        let dep_info = std::io::read_to_string(dep_info).ok()?;
+    /// Content digest of the sources a dep-info names. It only decides
+    /// whether an active unit looks up the cache; it never keys one.
+    fn source_set_digest(&self, dep_info: &Path) -> Option<String> {
+        let dep_info = std::io::read_to_string(open_dep_info(dep_info)?).ok()?;
         let sources = crate::cache_key::parse_dep_info(&dep_info);
         // Contents only, sorted: a restore may spell the same paths differently.
         let mut contents = Vec::with_capacity(sources.len());
@@ -405,8 +407,8 @@ impl AdaptiveUnit {
             } else {
                 self.invocation_cwd.as_ref()?.join(source)
             };
-            // The last compile's dep-info can name a module a branch switch
-            // deleted; the files that remain still identify the return.
+            // A file the cached build read and a branch switch deleted drops
+            // out, so the digest no longer matches that build.
             let mut input = match File::open(&path) {
                 Ok(input) => input,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -433,6 +435,28 @@ impl AdaptiveUnit {
             hash.update(content);
         }
         Some(hash.finalize().to_hex().to_string())
+    }
+
+    /// Copy the unit's dep-info to [`CACHED_DEP_INFO`] after a build that
+    /// went through the cache, and return the copy's source digest.
+    fn record_cached_sources(&self) -> Option<String> {
+        let dep_info = std::io::read_to_string(open_dep_info(self.dep_info.as_ref()?)?).ok()?;
+        let copy = self.cached_dep_info();
+        if unsafe_file(&copy)
+            || crate::atomic::atomic_replace_deferrable(&copy, dep_info.as_bytes(), false).is_err()
+        {
+            return None;
+        }
+        self.source_set_digest(&copy)
+    }
+
+    /// The digest of [`CACHED_DEP_INFO`]'s sources as they are now.
+    fn cached_source_set_digest(&self) -> Option<String> {
+        self.source_set_digest(&self.cached_dep_info())
+    }
+
+    fn cached_dep_info(&self) -> PathBuf {
+        self.unit_dir.join(CACHED_DEP_INFO)
     }
 
     fn observation(&self, fingerprint: &KeyFingerprint, now: u64) -> Observation {
@@ -557,7 +581,7 @@ impl AdaptiveUnit {
         let current = state
             .cached_sources
             .as_ref()
-            .and_then(|_| self.source_set_digest());
+            .and_then(|_| self.cached_source_set_digest());
         if current.is_some() && current == state.cached_sources && current != state.last_sources {
             return None;
         }
@@ -716,7 +740,7 @@ impl AdaptiveUnit {
             active_leases: 0,
             last_used_secs: now,
             in_flight: false,
-            cached_sources: self.source_set_digest(),
+            cached_sources: self.record_cached_sources(),
             last_sources: None,
         };
         let stored = self.store_state(&learning, false);
@@ -1063,7 +1087,7 @@ impl Lease {
                 last_sources: previous
                     .cached_sources
                     .as_ref()
-                    .and_then(|_| self.unit.source_set_digest()),
+                    .and_then(|_| self.unit.cached_source_set_digest()),
                 cached_sources: previous.cached_sources,
             }),
             // A failed seed leaves the unit as it found it; the next miss seeds again.
@@ -1358,10 +1382,17 @@ fn reset_locked(unit: &AdaptiveUnit) -> bool {
     }
     if !remove_path_safely(&unit.rustc_dir)
         || !remove_path_safely(&unit.unit_dir.join(DEFERRED_GRAPH))
+        || !remove_path_safely(&unit.cached_dep_info())
     {
         return false;
     }
     remove_path_safely(&unit.state_path)
+}
+
+/// A dep-info no larger than [`MAX_DEP_INFO_BYTES`].
+fn open_dep_info(path: &Path) -> Option<File> {
+    let dep_info = File::open(path).ok()?;
+    (dep_info.metadata().ok()?.len() <= MAX_DEP_INFO_BYTES).then_some(dep_info)
 }
 
 fn remove_path_safely(path: &Path) -> bool {
@@ -2886,6 +2917,112 @@ mod tests {
         assert!(unit.try_active_at(109).is_none());
     }
 
+    /// Write each `(path, contents)` under `checkout`, deleting it for `None`.
+    fn check_out(checkout: &Path, files: &[(&str, Option<&str>)]) {
+        for (path, contents) in files {
+            match contents {
+                Some(contents) => fs::write(checkout.join(path), contents).unwrap(),
+                None => fs::remove_file(checkout.join(path)).unwrap(),
+            }
+        }
+    }
+
+    /// The dep-info a compile of these sources leaves behind.
+    fn compiled(unit: &AdaptiveUnit, sources: &[&str]) {
+        let dep_info = format!("out.d: {}\n", sources.join(" "));
+        fs::write(unit.dep_info.as_ref().unwrap(), dep_info).unwrap();
+    }
+
+    /// Seed the unit after a miss whose compile read `sources`.
+    fn seed_from(unit: &AdaptiveUnit, sources: &[&str], at: u64) {
+        let seed = unit
+            .try_seed_at(
+                &cache_key("second"),
+                &fields("stable", "source-b", "extern-a"),
+                at,
+            )
+            .unwrap();
+        fs::write(seed.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
+        compiled(unit, sources);
+        assert!(seed.finish_at(CompileOutcome::Success, at + 1));
+    }
+
+    /// A branch switch away from cached sources and back, where the cached
+    /// side adds a module. The private compile's dep-info never names it.
+    #[test]
+    fn a_return_to_cached_sources_that_add_a_file_looks_up_the_cache() {
+        let (_temp, checkout, unit) = fixture_with_sources();
+        let with_b = [
+            ("src/lib.rs", Some("mod a; mod b;")),
+            ("src/b.rs", Some("b")),
+        ];
+        check_out(&checkout, &with_b);
+        compiled(&unit, &["src/lib.rs", "src/a.rs", "src/b.rs"]);
+        teach(&unit, 100);
+        assert!(unit.cached_dep_info().is_file());
+
+        check_out(
+            &checkout,
+            &[("src/lib.rs", Some("mod a;")), ("src/b.rs", None)],
+        );
+        seed_from(&unit, &["src/lib.rs", "src/a.rs"], 101);
+
+        check_out(&checkout, &with_b);
+        assert!(unit.try_active_at(103).is_none());
+        let state = read_state(&unit);
+        assert_eq!((state.phase, state.in_flight), (Phase::Active, false));
+    }
+
+    /// Only the files the cached build read decide a return: one a private
+    /// compile added and a switch deleted does not count, and one the
+    /// cached build read that is still missing means the sources moved.
+    #[test]
+    fn a_return_is_judged_by_the_files_the_cached_build_read() {
+        let (_temp, checkout, unit) = fixture_with_sources();
+        teach(&unit, 100);
+        check_out(
+            &checkout,
+            &[
+                ("src/lib.rs", Some("mod a; mod c;")),
+                ("src/c.rs", Some("c")),
+            ],
+        );
+        seed_from(&unit, &["src/lib.rs", "src/a.rs", "src/c.rs"], 101);
+
+        check_out(
+            &checkout,
+            &[("src/lib.rs", Some("mod a;")), ("src/c.rs", None)],
+        );
+        assert!(unit.try_active_at(103).is_none());
+
+        check_out(&checkout, &[("src/a.rs", None)]);
+        let lease = unit
+            .try_active_at(104)
+            .expect("a cached file that is gone is not a return");
+        assert!(lease.finish_at(CompileOutcome::Success, 105));
+    }
+
+    /// A state with no copy of its cached dep-info, as an older Kache wrote
+    /// it, keeps the fast path instead of guessing a return. A reset removes
+    /// the copy with the state.
+    #[test]
+    fn a_state_without_its_cached_dep_info_keeps_the_fast_path() {
+        let (_temp, checkout, unit) = fixture_with_sources();
+        teach(&unit, 100);
+        check_out(&checkout, &[("src/a.rs", Some("edited"))]);
+        seed_from(&unit, &["src/lib.rs", "src/a.rs"], 101);
+        fs::remove_file(unit.cached_dep_info()).unwrap();
+
+        check_out(&checkout, &[("src/a.rs", Some("cached"))]);
+        let lease = unit.try_active_at(103).expect("no copy, no lookup");
+        assert!(lease.finish_at(CompileOutcome::Success, 104));
+
+        teach(&unit, 105);
+        assert!(unit.cached_dep_info().is_file());
+        assert!(unit.reset());
+        assert!(!path_exists(&unit.cached_dep_info()));
+    }
+
     #[test]
     fn source_set_digest_covers_only_a_complete_readable_dep_info() {
         let (_temp, checkout, mut unit) = fixture_with_sources();
@@ -2893,11 +3030,11 @@ mod tests {
         let write = |text: &str| fs::write(&dep_info, text).unwrap();
         let relative = "out.d: src/lib.rs src/a.rs\n";
         write(relative);
-        let digest = unit.source_set_digest().unwrap();
+        let digest = unit.source_set_digest(&dep_info).unwrap();
         assert_eq!(read_state_after_teach(&unit), Some(digest.clone()));
 
         fs::write(checkout.join("src/a.rs"), "edited").unwrap();
-        let from_edit = unit.source_set_digest();
+        let from_edit = unit.source_set_digest(&dep_info);
         assert_ne!(from_edit, Some(digest));
 
         // The size cap is inclusive.
@@ -2906,25 +3043,25 @@ mod tests {
             "{relative}#{}",
             "x".repeat(at_cap - relative.len() - 1)
         ));
-        assert!(unit.source_set_digest().is_some());
+        assert!(unit.source_set_digest(&dep_info).is_some());
         write(&format!(
             "{relative}#{}",
             "x".repeat(at_cap - relative.len())
         ));
-        assert!(unit.source_set_digest().is_none());
+        assert!(unit.source_set_digest(&dep_info).is_none());
 
         // A deleted file drops out of the set; nothing left is no digest.
         write("out.d: src/lib.rs src/a.rs src/deleted.rs\n");
-        assert_eq!(unit.source_set_digest(), from_edit);
+        assert_eq!(unit.source_set_digest(&dep_info), from_edit);
         for unusable in ["out.d:\n", "out.d: src/deleted.rs\n", "out.d: src\n"] {
             write(unusable);
-            assert!(unit.source_set_digest().is_none(), "{unusable:?}");
+            assert!(unit.source_set_digest(&dep_info).is_none(), "{unusable:?}");
         }
         // Only a missing file is skipped; any other open error gives up.
         #[cfg(unix)]
         {
             write("out.d: src/lib.rs src/lib.rs/below\n");
-            assert!(unit.source_set_digest().is_none());
+            assert!(unit.source_set_digest(&dep_info).is_none());
         }
 
         // The budget on source bytes is inclusive.
@@ -2932,24 +3069,24 @@ mod tests {
         let sized = |len: u64| File::create(&big).unwrap().set_len(len).unwrap();
         write("out.d: src/big.rs\n");
         sized(MAX_SOURCE_BYTES);
-        assert!(unit.source_set_digest().is_some());
+        assert!(unit.source_set_digest(&dep_info).is_some());
         sized(MAX_SOURCE_BYTES + 1);
-        assert!(unit.source_set_digest().is_none());
+        assert!(unit.source_set_digest(&dep_info).is_none());
 
         // Spelling does not matter, but relative paths need the invocation
         // directory.
         write(relative);
-        let from_relative = unit.source_set_digest();
+        let from_relative = unit.source_set_digest(&dep_info);
         write(&format!(
             "out.d: {} {}\n",
             checkout.join("src/a.rs").display(),
             checkout.join("src/lib.rs").display()
         ));
-        assert_eq!(unit.source_set_digest(), from_relative);
+        assert_eq!(unit.source_set_digest(&dep_info), from_relative);
         unit.invocation_cwd = None;
-        assert_eq!(unit.source_set_digest(), from_relative);
+        assert_eq!(unit.source_set_digest(&dep_info), from_relative);
         write(relative);
-        assert!(unit.source_set_digest().is_none());
+        assert!(unit.source_set_digest(&dep_info).is_none());
     }
 
     fn read_state_after_teach(unit: &AdaptiveUnit) -> Option<String> {

@@ -867,6 +867,49 @@ fn a_build_script_stamping_its_sources_still_adapts() {
     }
 }
 
+/// Switching back to a commit that adds a module restores the unit from the
+/// cache, although the private compile in between never read that module.
+#[test]
+fn a_return_to_cached_sources_that_add_a_module_restores_them() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
+    let target = project.path().join("target");
+    create_fixture(project.path());
+
+    let first_mtime = past_mtime();
+    let mut tick = 0;
+    let mut check_out = |files: &[(&str, Option<&str>)]| {
+        tick += 1;
+        build_files(
+            project.path(),
+            cache.path(),
+            &target,
+            first_mtime + tick,
+            files,
+        )
+    };
+    let with_module = [
+        (
+            "src/lib.rs",
+            Some("mod added;\npub fn answer() -> u64 { added::ANSWER }\n"),
+        ),
+        ("src/added.rs", Some("pub const ANSWER: u64 = 2;\n")),
+    ];
+    let without_module = [
+        ("src/lib.rs", Some("pub fn answer() -> u64 { 1 }\n")),
+        ("src/added.rs", None),
+    ];
+
+    let stored = check_out(&with_module);
+    assert_eq!(stored["result"], "miss", "event: {stored:#}");
+    let switched = check_out(&without_module);
+    assert_passthrough(&switched, "adaptive seed");
+    let returned = check_out(&with_module);
+    assert_eq!(returned["result"], "local_hit", "event: {returned:#}");
+    assert_eq!(returned["compiler_runs"], 0, "event: {returned:#}");
+}
+
 #[test]
 fn user_facing_executable_without_fallback_uses_default_immediate_adaptive_lane() {
     let project = tempfile::tempdir().unwrap();

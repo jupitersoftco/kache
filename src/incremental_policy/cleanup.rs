@@ -133,7 +133,11 @@ fn stale_bytes(unit: &AdaptiveUnit, window: Duration, at: SystemTime) -> Option<
     if at.duration_since(last_used).ok()? < window {
         return None;
     }
-    Some(crate::unit_prune::size(&unit.rustc_dir) + crate::unit_prune::size(&unit.state_path))
+    Some(
+        crate::unit_prune::size(&unit.rustc_dir)
+            + crate::unit_prune::size(&unit.state_path)
+            + crate::unit_prune::size(&unit.cached_dep_info()),
+    )
 }
 
 #[cfg(test)]
