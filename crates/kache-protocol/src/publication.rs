@@ -106,8 +106,9 @@ pub struct PublishRustcDebugRequest {
     pub files: Vec<HandoffFile>,
     /// The executable among `files`, relative to `staging_dir`.
     pub executable: String,
-    /// Entry name of the bundle tar, `<executable>.dsym.tar`.
-    pub bundle_store_name: String,
+    /// Stem of the bundle's entry names, the executable's store name: the
+    /// daemon stores `<stem>.dsym.json` and one `<stem>.dsym.<n>` per file.
+    pub bundle_stem: String,
     /// Where the build left the executable. The finished `.dSYM` is placed
     /// next to it if it still has `uuid`.
     pub installed_executable: String,
@@ -148,7 +149,7 @@ mod tests {
             staging_dir: "/s".to_string(),
             files: vec![],
             executable: "bin/demo".to_string(),
-            bundle_store_name: "demo.dsym.tar".to_string(),
+            bundle_stem: "demo".to_string(),
             installed_executable: "/t/demo".to_string(),
             uuid: "0".repeat(32),
             dsymutil: "/usr/bin/dsymutil".to_string(),

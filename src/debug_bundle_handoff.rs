@@ -26,8 +26,9 @@
 //!   reads from Cargo's profile directory. It points the bundle's recorded
 //!   executable path back at the build's executable, places a copy of the
 //!   bundle next to that executable if it is still the one that was linked
-//!   (same `LC_UUID`), tars the bundle as `sync` does, and stores executable,
-//!   other files and tar in one put. Restores see the same entry either way.
+//!   (same `LC_UUID`), stages the bundle file by file with a manifest as
+//!   `sync` does (kunobi-ninja/kache#1905), and stores executable, other
+//!   files and bundle in one put. Restores see the same entry either way.
 //! - Until that put the key has no entry: a build that needs it meanwhile
 //!   misses and compiles. A bundle that fails, or runs past a time limit that
 //!   grows with the job's inputs, stores nothing: no executable is stored
@@ -74,6 +75,8 @@ const OBJECTS_DIR: &str = "objects";
 const FILES_DIR: &str = "files";
 /// `dsymutil` output inside a job directory.
 const OUTPUT_DIR: &str = "out";
+/// The bundle staged for the store, a manifest and one file per regular file.
+const BUNDLE_FILES_DIR: &str = "bundle";
 
 /// Jobs at once. Each runs `dsymutil` with [`DSYMUTIL_THREADS`].
 pub(crate) const WORKERS: usize = 2;
@@ -414,7 +417,7 @@ fn request_for(
         staging_dir: capture.dir.to_string_lossy().into_owned(),
         files: capture.files.clone(),
         executable: capture.executable.clone(),
-        bundle_store_name: format!("{}.dsym.tar", executable.store_name),
+        bundle_stem: executable.store_name.to_owned(),
         installed_executable: executable.path.to_string_lossy().into_owned(),
         uuid: uuid_hex(&capture.uuid),
         dsymutil: executable.dsymutil.program.clone(),
@@ -552,11 +555,8 @@ fn validate(config: &Config, request: &PublishRustcDebugRequest) -> Result<[u8; 
     {
         return Err("the executable is not among the files".to_string());
     }
-    if request.bundle_store_name.is_empty() || request.bundle_store_name.contains(['/', '\\']) {
-        return Err(format!(
-            "invalid bundle name {:?}",
-            request.bundle_store_name
-        ));
+    if request.bundle_stem.is_empty() || request.bundle_stem.contains(['/', '\\']) {
+        return Err(format!("invalid bundle name {:?}", request.bundle_stem));
     }
     if !Path::new(&request.installed_executable).is_absolute() {
         return Err("the installed executable path is not absolute".to_string());
@@ -892,8 +892,8 @@ fn write_job_event(
     crate::wrapper::write_event_waiting(config, &event);
 }
 
-/// The entry's files, `(absolute path, store name)`, the bundle tar among
-/// them. An error when the bundle could not be built: the job then stores
+/// The entry's files, `(absolute path, store name)`, the bundle's manifest
+/// and files among them. An error when the bundle could not be built: the job then stores
 /// nothing.
 fn entry_files(
     job: &DebugBundleJob,
@@ -907,19 +907,20 @@ fn entry_files(
         .iter()
         .map(|file| (job.dir.join(&file.path), file.store_name.clone()))
         .collect();
-    let tar = build_bundle(job, dsymutil, timeout, abort)?;
-    files.push((tar, job.request.bundle_store_name.clone()));
+    files.extend(build_bundle(job, dsymutil, timeout, abort)?);
     Ok(files)
 }
 
-/// Run `dsymutil`, place the bundle next to the build's executable, and tar
-/// it. Returns the tar. `abort` stops `dsymutil` (see [`run_bounded`]).
+/// Run `dsymutil`, place the bundle next to the build's executable, and
+/// stage it as the synchronous path does: a manifest and one file per
+/// regular file of the bundle. Returns them as `(path, store name)`.
+/// `abort` stops `dsymutil` (see [`run_bounded`]).
 fn build_bundle(
     job: &DebugBundleJob,
     dsymutil: &DsymutilCommand,
     timeout: Duration,
     abort: &AtomicBool,
-) -> Result<PathBuf> {
+) -> Result<Vec<(PathBuf, String)>> {
     let request = &job.request;
     let executable = job.dir.join(&request.executable);
     let name = executable
@@ -951,9 +952,14 @@ fn build_bundle(
             installed.display()
         ),
     }
-    let tar = job.dir.join(&request.bundle_store_name);
-    crate::compiler::platform::build_deterministic_tar(&bundle, &tar)?;
-    Ok(tar)
+    let staged = job.dir.join(BUNDLE_FILES_DIR);
+    std::fs::create_dir_all(&staged)?;
+    let artifacts = crate::compiler::debug_bundle::stage(&bundle, &request.bundle_stem, &staged)?
+        .into_artifacts();
+    Ok(artifacts
+        .into_iter()
+        .map(|artifact| (artifact.path, artifact.store_name))
+        .collect())
 }
 
 /// Run `command` to completion within `timeout`, its stderr in `log`. A run

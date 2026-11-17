@@ -5837,7 +5837,7 @@ fn materialize_reports_a_mutating_external_action_as_not_exact() {
             _binary: &Path,
             _staging_dir: &Path,
             _split_debuginfo: Option<&str>,
-        ) -> Result<Option<PathBuf>> {
+        ) -> Result<Option<crate::compiler::debug_bundle::StagedDebugBundle>> {
             Ok(None)
         }
     }
@@ -5955,7 +5955,7 @@ fn an_unproven_loadability_check_runs_on_every_restore() {
             _binary: &Path,
             _staging_dir: &Path,
             _split_debuginfo: Option<&str>,
-        ) -> Result<Option<PathBuf>> {
+        ) -> Result<Option<crate::compiler::debug_bundle::StagedDebugBundle>> {
             Ok(None)
         }
     }
@@ -6404,6 +6404,69 @@ fn debug_bundle_restore_honors_the_current_policy_for_legacy_entries() {
     }
 }
 
+/// An entry with a bundle stored file by file (#1905) restores the bundle
+/// through its manifest and never places the manifest or its files beside
+/// the binary. The current opt-outs skip it like a legacy tar.
+#[test]
+fn split_debug_bundle_restore_honors_the_current_policy() {
+    for (flags, expected) in [
+        (vec!["-g"], true),
+        (vec!["-g", "-Csplit-debuginfo=off"], false),
+        (vec!["-Cdebuginfo=0"], false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().join("cache"));
+        let store = Store::open(&config).unwrap();
+        let out_dir = dir.path().join("target/debug/deps");
+        let blob = |content: &[u8]| {
+            let hash = blake3::hash(content).to_hex().to_string();
+            create_blob(&store, &hash, content);
+            hash
+        };
+        let executable = b"\x7fELFcached executable";
+        let mut primary = cached_file("foo", &blob(executable));
+        primary.size = executable.len() as u64;
+        primary.executable = true;
+        let manifest = br#"{"version":1,"files":[{"path":"Contents/Resources/DWARF/foo","name":"foo.dsym.0"}],"empty_files":["Contents/empty"]}"#;
+        let mut argv = vec![
+            "rustc",
+            "src/main.rs",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "bin",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ];
+        argv.extend(&flags);
+        let args = rustc_args(&argv);
+        let mut meta = entry_meta(
+            "split-debug-bundle",
+            vec![
+                primary,
+                cached_file("foo.dsym.json", &blob(manifest)),
+                cached_file("foo.dsym.0", &blob(b"d")),
+            ],
+            &[],
+        );
+        meta.crate_types = vec!["bin".into()];
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
+        assert!(out_dir.join("foo").is_file(), "{flags:?}");
+        assert!(!out_dir.join("foo.dsym.json").exists(), "{flags:?}");
+        assert!(!out_dir.join("foo.dsym.0").exists(), "{flags:?}");
+        let dwarf = out_dir.join("foo.dSYM/Contents/Resources/DWARF/foo");
+        assert_eq!(dwarf.is_file(), expected, "{flags:?}");
+        assert_eq!(
+            out_dir.join("foo.dSYM/Contents/empty").is_file(),
+            expected,
+            "{flags:?}"
+        );
+        if expected {
+            assert_eq!(std::fs::read(dwarf).unwrap(), b"d");
+        }
+    }
+}
+
 /// Tar bytes shaped like a store-time debug bundle: entries relative to
 /// the bundle root, the layout `unpack_debug_bundle` re-creates.
 fn debug_bundle_tar(dwarf_name: &str, dwarf: &[u8]) -> Vec<u8> {
@@ -6514,41 +6577,47 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
         .expect("cc link must be runnable on the macOS test host");
     assert!(link.success(), "cc link failed");
 
-    // Store side: bake + tar the bundle while the `.o` exists.
+    // Store side: bake + stage the bundle while the `.o` exists.
     use crate::compiler::platform::Platform as _;
     let staging = tempfile::tempdir().unwrap();
-    let tar_path = crate::compiler::platform::MacOsPlatform::default()
+    let artifacts = crate::compiler::platform::MacOsPlatform::default()
         .package_debug_bundle(&binary, staging.path(), Some("unpacked"))
         .unwrap()
-        .expect("macOS host must package a bundle for a -g binary");
+        .expect("macOS host must package a bundle for a -g binary")
+        .into_artifacts();
 
     // Cache + restore side, in a directory the `.o` never existed in.
     let restore_dir = tempfile::tempdir().unwrap();
     let config = test_config(restore_dir.path().join("cache"));
     let store = Store::open(&config).unwrap();
-    let hash = crate::cache_key::hash_file(&tar_path).unwrap();
-    let blob = store.blob_path(&hash);
-    std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
-    std::fs::copy(&tar_path, &blob).unwrap();
-    let cached = cached_file("hello-bin.dsym.tar", &hash);
+    let files: Vec<_> = artifacts
+        .iter()
+        .map(|artifact| (artifact.path.clone(), artifact.store_name.clone()))
+        .collect();
+    let key = "3193193193193193193193193193193193193193193193193193193193193193";
+    store
+        .put_with_compile_time(
+            key,
+            "hello",
+            &["bin".into()],
+            &[],
+            "",
+            "",
+            &files,
+            "",
+            "",
+            0,
+        )
+        .unwrap();
+    let meta = store.get(key).unwrap().unwrap();
     let deps = restore_dir.path().join("deps");
     std::fs::create_dir_all(&deps).unwrap();
-    let target = deps.join("hello-bin.dsym.tar");
-    let platform = platform::current();
-    materialize_cached_artifact(
-        crate::config::DEFAULT_RESTORE_MAX_SIZE,
+    crate::compiler::debug_bundle::restore(
         &store,
-        &cached,
-        &target,
-        ArtifactKind::DebugBundle,
-        None,
-        restore_dir.path(),
-        restore_dir.path(),
-        None,
-        &[],
-        &*platform,
-        "test restore",
-        None,
+        &meta.files,
+        &meta.files[0],
+        &deps.join("hello-bin.dsym.json"),
+        crate::config::DEFAULT_RESTORE_MAX_SIZE,
     )
     .unwrap();
 
@@ -9471,7 +9540,7 @@ fn local_hit_demand_reaches_event_without_remote_wait() {
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].schema, 27);
+    assert_eq!(events[0].schema, 28);
     let demands = &events[0].demands;
     assert_eq!(demands.len(), 1);
     assert_eq!(demands[0].cache_key, "local-demand-key");
@@ -9520,7 +9589,7 @@ fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
     assert_eq!(event.compile_time_ms, 20);
     assert_eq!(event.size, 30);
     assert_eq!(event.cache_key, "cache-key");
-    assert_eq!(event.schema, 27);
+    assert_eq!(event.schema, 28);
     assert_eq!(event.key_ms, 40);
     assert_eq!(event.key_hash_hits, 4);
     assert_eq!(event.key_hash_misses, 5);
@@ -9638,7 +9707,7 @@ fn log_event_records_the_wrapper_phase_accumulators() {
 
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     let event = &events[0];
-    assert_eq!(event.schema, 27);
+    assert_eq!(event.schema, 28);
     // Whatever other tests add is real time, far under the next band.
     for (name, value, floor, fed) in [
         ("startup_ms", event.startup_ms, before[0], STARTUP_MS),
@@ -9774,7 +9843,7 @@ fn log_event_persists_same_key_lookup_rejection() {
     let event = &events[0];
     assert_eq!(event.result, EventResult::Miss);
     assert_eq!(event.cache_key, "same-key");
-    assert_eq!(event.schema, 27);
+    assert_eq!(event.schema, 28);
     assert_eq!(
         event.lookup_rejection,
         "matching entry lacks dep-info required by this invocation"
@@ -9844,7 +9913,7 @@ fn log_event_persists_verify_compare_class_on_hit() {
             .keyed("hit-key", 0, FileHashStats::default()),
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
-    assert_eq!(events[0].schema, 27);
+    assert_eq!(events[0].schema, 28);
     assert_eq!(events[0].result, EventResult::LocalHit);
     assert!(
         events[0].verify_compare.is_empty(),
@@ -9862,7 +9931,7 @@ fn log_event_persists_verify_compare_class_on_hit() {
     );
     let events = crate::events::read_events(&config.event_log_path()).unwrap();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[1].schema, 27);
+    assert_eq!(events[1].schema, 28);
     assert_eq!(
         events[1].verify_compare,
         "content: libfoo.rlib (byte mismatch)"
@@ -12762,7 +12831,7 @@ fn a_passthrough_reason_is_classified_on_the_event() {
         EventInputs::new("/repo", "foo.c", EventResult::Passthrough, 10)
             .passthrough_reason("unsupported|cc link mode".to_string()),
     );
-    assert_eq!(event.schema, 27);
+    assert_eq!(event.schema, 28);
     assert_eq!(event.miss_reason, crate::events::MissReason::Unsupported);
     let hit = super::build_event_details(
         &config,
@@ -13089,7 +13158,7 @@ fn rebuilt_event_uses_actual_outputs_for_success_even_without_store() {
                 .store_error("cannot store".into())
                 .rebuilt(true, &artifacts, Some("cargo-package-name".into())),
         );
-        assert_eq!(event.schema, 27);
+        assert_eq!(event.schema, 28);
         assert_eq!(event.rebuilt_package.as_deref(), Some("cargo-package-name"));
         assert_eq!(
             event.rebuilt_fingerprint.as_deref(),
@@ -13171,12 +13240,21 @@ fn rebuilt_event_keeps_unknown_package_and_unkeyed_fingerprint_absent() {
     assert!(event.rebuilt_package.is_none());
     assert!(event.rebuilt_fingerprint.is_none());
     assert!(event.rebuilt_path.is_some());
-    let outputs = ArtifactSet::new(vec![crate::compiler::Artifact {
-        path: PathBuf::from("/staging/temp.dsym.tar"),
-        store_name: "bundle.tar".into(),
-        kind: ArtifactKind::DebugBundle,
-        required: false,
-    }]);
+    let outputs = ArtifactSet::new(
+        [
+            ArtifactKind::DebugBundle,
+            ArtifactKind::DebugBundleManifest,
+            ArtifactKind::DebugBundleFile,
+        ]
+        .into_iter()
+        .map(|kind| crate::compiler::Artifact {
+            path: PathBuf::from("/staging/temp.dsym.tar"),
+            store_name: "bundle.tar".into(),
+            kind,
+            required: false,
+        })
+        .collect(),
+    );
     let event = build_event_details(
         &config,
         EventInputs::new("/repo", "example", EventResult::Miss, 1)
@@ -14384,7 +14462,7 @@ fn cancelled_scheduler_waits_reach_error_events_without_spawning_compilers() {
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.result, EventResult::Error);
-        assert_eq!(event.schema, 27);
+        assert_eq!(event.schema, 28);
         assert_eq!(event.exit_code, None, "there was no compiler exit");
         assert!(event.passthrough_reason.is_empty());
         assert!(
@@ -14474,4 +14552,109 @@ fn daemon_event_writes_wait_out_a_busy_log_and_lose_nothing() {
             .iter()
             .all(|event| event.crate_name.starts_with("daemon-"))
     );
+}
+
+#[test]
+fn seed_attempt_is_settled_and_recorded_on_the_event() {
+    use super::SeedAttempt::*;
+    for (looked, portable, imported, attempt) in [
+        (false, true, false, NotTried),
+        (true, false, false, Unportable),
+        (true, true, false, NoDonor),
+        // A donor an earlier preparation imported counts, looked or not.
+        (false, false, true, Imported),
+        (true, true, true, Imported),
+    ] {
+        assert_eq!(
+            super::SeedAttempt::of(looked, portable, imported),
+            attempt,
+            "looked={looked} portable={portable} imported={imported}"
+        );
+    }
+    for (attempt, seeded, settled) in [
+        (NotTried, true, Imported),
+        (NotTried, false, NotTried),
+        (Imported, false, Unportable),
+        (NoDonor, false, NoDonor),
+        (Unportable, false, Unportable),
+    ] {
+        assert_eq!(
+            attempt.settle(seeded),
+            settled,
+            "{attempt:?} seeded={seeded}"
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    for (attempt, recorded) in [
+        (Imported, "imported"),
+        (NoDonor, "no-donor"),
+        (Unportable, "unportable"),
+        (NotTried, ""),
+    ] {
+        let event = super::build_event_details(
+            &config,
+            EventInputs::new("/repo", "unit", EventResult::Passthrough, 10)
+                .incremental_seed_attempt(attempt),
+        );
+        assert_eq!(event.incremental_seed_attempt, recorded);
+        // Older events lack the field; an empty one is not written.
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json.get("incremental_seed_attempt").is_some(),
+            !recorded.is_empty()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn preparation_records_whether_a_fresh_unit_looked_for_a_donor() {
+    use super::SeedAttempt::*;
+    let _lock = crate::test_support::process_state_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let _cache = crate::config::tests::set_env_for_test("KACHE_CACHE_DIR", Some(root.as_os_str()));
+    let compiler = root.join("rustc-mock");
+    kache_fs::testutil::write_executable(&compiler, "#!/bin/sh\nprintf 'rustc 1.99.0 (test)\\n'\n");
+    let missing = root.join("gone/target/debug");
+    // (automatic seeding, explicit donor, unstable) -> attempt
+    for (case, (automatic, explicit, unstable, expected)) in [
+        (false, false, true, NotTried),
+        (false, true, false, NotTried),
+        (false, true, true, NoDonor),
+        (true, false, false, NoDonor),
+        (true, true, false, NoDonor),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A fresh unit per case: each has no incremental state of its own.
+        let profile = root.join(format!("receiver-{case}/target/debug"));
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+        let args = RustcArgs::parse(&[
+            compiler.display().to_string(),
+            "--crate-name".into(),
+            "sample".into(),
+            "src/lib.rs".into(),
+            "--out-dir".into(),
+            profile.join("deps").display().to_string(),
+            "-Cincremental=".to_owned() + profile.join("incremental").to_str().unwrap(),
+            "-Cextra-filename=-1234abcd".into(),
+            "-Zremap-cwd-prefix=/src".into(),
+        ])
+        .unwrap();
+        let unit = crate::incremental_policy::AdaptiveUnit::eligible(&args, b"guard").unwrap();
+        let mut config = test_config(root.join("cache"));
+        config.seed_incremental = automatic;
+        config.unstable = unstable;
+        config.incremental_seed_from = explicit.then(|| missing.clone());
+        let mut lease = unit.try_immediate().unwrap();
+        let (_, attempt) = super::prepare_worktree_compiler_args(&config, &args, &mut lease);
+        assert_eq!(
+            attempt, expected,
+            "automatic={automatic} explicit={explicit} unstable={unstable}"
+        );
+    }
 }

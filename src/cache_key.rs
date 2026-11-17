@@ -289,6 +289,10 @@ mod apple_install_name;
 // `KACHE_RUSTC_PATH_NORMALIZE=0` still fold every prefix. Only the trybuild
 // `remap:none` bytes change, so a previous trybuild entry misses and every
 // other key stays valid.
+//
+// Keying adjacent cc `-I` operands in a canonical order needs no bump either.
+// A compile with such a run folds a new marker into its resolution digest, so
+// its earlier entries miss once; a compile without one keys as before.
 pub(crate) use kache_format::CACHE_KEY_VERSION;
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
@@ -945,14 +949,45 @@ impl GuardWalk {
     }
 }
 
-/// One root of a [`GuardWalk`], as [`crate::tree_stamp::Stamper::walk_observing`]
-/// takes it.
-#[derive(Debug, Clone)]
+/// One root of a [`GuardWalk`], as [`stamp_roots`] walks it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WalkedRoot {
     path: PathBuf,
     role: Vec<u8>,
     excluded: Vec<PathBuf>,
+    /// Directory names left out at any depth below the root.
+    excluded_dirs: Vec<std::ffi::OsString>,
     rules: crate::tree_stamp::StampRules,
+}
+
+/// What a guard walk leaves out below its root: `paths`, and every
+/// directory named in `dir_names` ([`names_guard_excluded`]). A symlink is
+/// never a directory here.
+#[derive(Clone, Copy)]
+struct GuardSkips<'a> {
+    paths: &'a [PathBuf],
+    dir_names: &'a [std::ffi::OsString],
+}
+
+impl GuardSkips<'_> {
+    fn skips(&self, path: &Path, entry: &std::fs::DirEntry) -> bool {
+        self.paths
+            .iter()
+            .any(|skipped| skipped.file_name() == path.file_name() && skipped == path)
+            || (!self.dir_names.is_empty()
+                && names_guard_excluded(&entry.file_name(), self.dir_names)
+                && entry.file_type().is_ok_and(|kind| kind.is_dir()))
+    }
+}
+
+/// Is `name` one of `excluded`? Compared without ASCII case, as a
+/// case-insensitive filesystem would match it.
+fn names_guard_excluded(name: &OsStr, excluded: &[std::ffi::OsString]) -> bool {
+    excluded.iter().any(|excluded| {
+        excluded
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(name.as_encoded_bytes())
+    })
 }
 
 /// Why [`stamp_roots`] gave no stamps.
@@ -966,10 +1001,11 @@ enum StampRefusal {
     Unwalkable,
 }
 
+#[derive(Clone)]
 struct StampedRoot {
     stamp: crate::tree_stamp::TreeStamp,
     entries: usize,
-    small_files: Vec<FileFingerprint>,
+    small_files: std::sync::Arc<Vec<FileFingerprint>>,
 }
 
 // A weak identity can survive replacement while the containing tree changes.
@@ -1001,53 +1037,85 @@ fn stamp_roots(
                 hook(&root.path);
             }
         });
-        let mut stamper = crate::tree_stamp::Stamper::new();
-        let mut budget = max_entries;
-        stamper.label(&root.role);
-        let mut small_files = Vec::new();
-        let mut observe = |path: PathBuf, metadata: &std::fs::Metadata| {
-            let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
-            let inode = metadata_inode(metadata);
-            if collect_small_files && metadata.is_file() && guard_file_memo_eligible(size, inode) {
-                // The memo stores UTF-8 paths. Lossy spellings could merge
-                // distinct names in the path-keyed batch result.
-                if !path.is_absolute() {
-                    return;
-                }
-                let Ok(path) = path.into_os_string().into_string() else {
-                    return;
-                };
-                small_files.push(FileFingerprint {
-                    path,
-                    size,
-                    mtime_ns: metadata_mtime_ns(metadata),
-                    ctime_ns: metadata_ctime_ns(metadata),
-                    inode,
-                });
+        match stamp_one_root(root, max_entries, collect_small_files) {
+            Ok(stamped) => stamps.push(stamped),
+            Err(crate::tree_stamp::WalkOutcome::TooLarge) => {
+                return Err(StampRefusal::TooLarge(index));
             }
-        };
-        match stamper.walk_observing(
-            &root.path,
-            &root.excluded,
-            root.rules,
-            &mut budget,
-            &mut observe,
-        ) {
-            crate::tree_stamp::WalkOutcome::Fits => {
-                stamps.push(StampedRoot {
-                    stamp: stamper.finish(),
-                    entries: max_entries - budget,
-                    small_files,
-                });
-            }
-            crate::tree_stamp::WalkOutcome::TooLarge => return Err(StampRefusal::TooLarge(index)),
-            crate::tree_stamp::WalkOutcome::Unreadable => return Err(StampRefusal::Unwalkable),
+            Err(
+                crate::tree_stamp::WalkOutcome::Unreadable | crate::tree_stamp::WalkOutcome::Fits,
+            ) => return Err(StampRefusal::Unwalkable),
         }
     }
     if stamps.iter().map(|root| root.entries).sum::<usize>() > max_entries {
         return Err(StampRefusal::TooLargeTogether);
     }
     Ok(stamps)
+}
+
+/// Concurrent walks of one root, as units of one workspace stamp it.
+static STAMP_WALKS: std::sync::LazyLock<
+    crate::walk_flight::NextFlight<(WalkedRoot, usize, bool), StampOutcome>,
+> = std::sync::LazyLock::new(crate::walk_flight::NextFlight::new);
+
+type StampOutcome = std::result::Result<StampedRoot, crate::tree_stamp::WalkOutcome>;
+
+/// The stamp of `root` from a walk that started after this call, shared with
+/// the units that asked for the same walk meanwhile ([`crate::walk_flight`]).
+fn stamp_one_root(
+    root: &WalkedRoot,
+    max_entries: usize,
+    collect_small_files: bool,
+) -> StampOutcome {
+    STAMP_WALKS.run(&(root.clone(), max_entries, collect_small_files), || {
+        walk_one_root(root, max_entries, collect_small_files)
+    })
+}
+
+fn walk_one_root(root: &WalkedRoot, max_entries: usize, collect_small_files: bool) -> StampOutcome {
+    let mut stamper = crate::tree_stamp::Stamper::new();
+    let mut budget = max_entries;
+    stamper.label(&root.role);
+    let mut small_files = Vec::new();
+    let mut observe = |path: PathBuf, metadata: &std::fs::Metadata| {
+        let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let inode = metadata_inode(metadata);
+        if collect_small_files && metadata.is_file() && guard_file_memo_eligible(size, inode) {
+            // The memo stores UTF-8 paths. Lossy spellings could merge
+            // distinct names in the path-keyed batch result.
+            if !path.is_absolute() {
+                return;
+            }
+            let Ok(path) = path.into_os_string().into_string() else {
+                return;
+            };
+            small_files.push(FileFingerprint {
+                path,
+                size,
+                mtime_ns: metadata_mtime_ns(metadata),
+                ctime_ns: metadata_ctime_ns(metadata),
+                inode,
+            });
+        }
+    };
+    let skips = GuardSkips {
+        paths: &root.excluded,
+        dir_names: &root.excluded_dirs,
+    };
+    match stamper.walk_skipping_observing(
+        &root.path,
+        &|path, entry| skips.skips(path, entry),
+        root.rules,
+        &mut budget,
+        &mut observe,
+    ) {
+        crate::tree_stamp::WalkOutcome::Fits => Ok(StampedRoot {
+            stamp: stamper.finish(),
+            entries: max_entries - budget,
+            small_files: std::sync::Arc::new(small_files),
+        }),
+        outcome => Err(outcome),
+    }
 }
 
 /// [`stamp_roots`] for one root.
@@ -1204,6 +1272,9 @@ struct TreeRoot<'a> {
     /// Kache's own directories, and what Cargo writes in its home, below the
     /// root ([`own_dirs_within`]), left out wherever they lie.
     own: Vec<PathBuf>,
+    /// Directory names left out at any depth below the root
+    /// ([`WorkspaceRoots::guard_excluded`]).
+    excluded_dirs: Vec<std::ffi::OsString>,
 }
 
 impl<'a> TreeRoot<'a> {
@@ -1214,12 +1285,20 @@ impl<'a> TreeRoot<'a> {
             skipped,
             skips_build_dirs: false,
             own: Vec::new(),
+            excluded_dirs: Vec::new(),
         }
     }
 
     fn skipping_build_dirs(self) -> Self {
         Self {
             skips_build_dirs: true,
+            ..self
+        }
+    }
+
+    fn excluding_dirs(self, names: &[std::ffi::OsString]) -> Self {
+        Self {
+            excluded_dirs: names.to_vec(),
             ..self
         }
     }
@@ -1251,6 +1330,7 @@ impl<'a> TreeRoot<'a> {
             path: self.path.clone(),
             role: self.role.to_vec(),
             excluded: self.excluded(),
+            excluded_dirs: self.excluded_dirs.clone(),
             rules: self.stamp_rules(),
         }
     }
@@ -1275,11 +1355,20 @@ fn tree_digest(
 /// pre-pass, so a stale answer costs a shortcut, never a wrong key.
 pub(crate) const OVERSIZED_TREE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// The marker recording that `root` holds more than `max_entries` entries.
-fn oversized_tree_marker(memo_dir: &Path, root: &Path, max_entries: usize) -> PathBuf {
+/// The marker recording that `root` holds more than `max_entries` entries
+/// once the directories named in `excluded_dirs` are left out.
+fn oversized_tree_marker(
+    memo_dir: &Path,
+    root: &Path,
+    excluded_dirs: &[std::ffi::OsString],
+    max_entries: usize,
+) -> PathBuf {
     let mut hasher = blake3::Hasher::new();
     hasher.update(root.as_os_str().as_encoded_bytes());
     hasher.update(&max_entries.to_le_bytes());
+    for name in excluded_dirs {
+        fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
+    }
     memo_dir
         .join("oversized-trees")
         .join(&hasher.finalize().to_hex()[..32])
@@ -1296,6 +1385,9 @@ fn oversized_roots_marker(memo_dir: &Path, roots: &[WalkedRoot], max_entries: us
             b"root:",
             root.path.as_os_str().as_encoded_bytes(),
         );
+        for name in &root.excluded_dirs {
+            fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
+        }
     }
     hasher.update(&max_entries.to_le_bytes());
     memo_dir
@@ -1357,7 +1449,7 @@ fn tree_digest_memoised(
     }
     if roots.iter().any(|root| {
         marked_recently(
-            &oversized_tree_marker(memo_dir, &root.path, max_entries),
+            &oversized_tree_marker(memo_dir, &root.path, &root.excluded_dirs, max_entries),
             now,
         )
     }) {
@@ -1374,6 +1466,7 @@ fn tree_digest_memoised(
             write_marker(&oversized_tree_marker(
                 memo_dir,
                 &walked[index].path,
+                &walked[index].excluded_dirs,
                 max_entries,
             ));
             return None;
@@ -1451,10 +1544,18 @@ fn root_digest(
     let mut hasher = blake3::Hasher::new();
     hasher.update(TREE_DIGEST_VERSION);
     fold_field(&mut hasher, b"root:", root.role);
+    // Only when set, so a tree without exclusions keeps its digest.
+    for name in &root.excluded_dirs {
+        fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
+    }
+    let excluded = root.excluded();
     let read_every_file = crate_tree_fold(
         &root.path,
         &root.path,
-        &root.excluded(),
+        GuardSkips {
+            paths: &excluded,
+            dir_names: &root.excluded_dirs,
+        },
         root.skips_build_dirs,
         &GuardFileHashes {
             hasher: file_hasher,
@@ -1508,6 +1609,9 @@ fn tree_digest_memo(memo_dir: &Path, root: &TreeRoot<'_>) -> PathBuf {
     fold_field(&mut hasher, b"role:", root.role);
     for name in root.skipped {
         fold_field(&mut hasher, b"skipped:", name.as_bytes());
+    }
+    for name in &root.excluded_dirs {
+        fold_field(&mut hasher, b"excluded_dir:", name.as_encoded_bytes());
     }
     fold_field(
         &mut hasher,
@@ -1579,7 +1683,7 @@ struct GuardFileHashes<'a, 'db> {
 fn crate_tree_fold(
     root: &Path,
     directory: &Path,
-    excluded: &[PathBuf],
+    excluded: GuardSkips<'_>,
     skips_build_dirs: bool,
     files: &GuardFileHashes<'_, '_>,
     hasher: &mut blake3::Hasher,
@@ -1602,7 +1706,7 @@ fn crate_tree_fold(
     let mut read_every_file = true;
     for entry in entries {
         let path = entry.path();
-        if excluded.contains(&path) {
+        if excluded.skips(&path, &entry) {
             continue;
         }
         *budget = budget.checked_sub(1)?;
@@ -1673,6 +1777,7 @@ pub(crate) struct InvocationKeyScope {
     compile_while_keying: bool,
     provided_dep_info: Option<(DepInfo, Option<TreeGuard>)>,
     remote_rows: Option<RemoteRows>,
+    compiled_remaps: Option<CompiledRemaps>,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -1683,6 +1788,7 @@ impl InvocationKeyScope {
             compile_while_keying: COMPILE_WHILE_KEYING.with(|cell| cell.replace(false)),
             provided_dep_info: PROVIDED_DEP_INFO.with(|cell| cell.replace(None)),
             remote_rows: REMOTE_ROWS.with(|cell| cell.replace(None)),
+            compiled_remaps: COMPILED_REMAPS.with(|cell| cell.replace(None)),
             _thread_bound: std::marker::PhantomData,
         }
     }
@@ -1695,6 +1801,7 @@ impl Drop for InvocationKeyScope {
         let discarded_dep_info =
             PROVIDED_DEP_INFO.with(|cell| cell.replace(self.provided_dep_info.take()));
         let discarded_remote = REMOTE_ROWS.with(|cell| cell.replace(self.remote_rows.take()));
+        COMPILED_REMAPS.with(|cell| *cell.borrow_mut() = self.compiled_remaps.take());
         // Release callback captures after every slot has been restored and
         // outside the RefCell borrow, so their destructors can observe it.
         drop((discarded_dep_info, discarded_remote));
@@ -1990,23 +2097,20 @@ fn hash_rustc_version_for_unit<H: KeyFold>(
     hasher.update(text.as_bytes());
     hasher.update(b"\n");
     if namespace {
-        fold_field(hasher, b"host_neutral_sources.v1:", b"1");
+        fold_field(hasher, b"host_neutral_sources.v2:", b"1");
     }
 }
 
-/// `(drop host line, fold host_neutral_sources.v1)`. The namespace stays when
+/// `(drop host line, fold host_neutral_sources.v2)`. The namespace stays when
 /// remaps were already applied, even if this key does not drop the host line.
 pub(crate) fn host_neutral_version_flags(neutral: bool, provisional_remaps: bool) -> (bool, bool) {
     (neutral, neutral || provisional_remaps)
 }
 
-pub(crate) fn version_flags_for_unit(neutral: bool) -> (bool, bool) {
-    host_neutral_version_flags(neutral, false)
-}
-
 /// `--remap-path-prefix` for every directory from `registry_src` down to each
 /// source's parent. `FROM` uses `host_sep` and ends with it. `TO` is
-/// `/cargo/registry/.../` so the matched separator is consumed. Longest last.
+/// `/kache/.cargo/registry/src/.../`, the shape the base remaps give a
+/// registry path, so the matched separator is consumed. Longest last.
 pub(crate) fn registry_directory_remaps(
     registry_src: &Path,
     sources: &[PathBuf],
@@ -2037,6 +2141,10 @@ pub(crate) fn registry_directory_remaps(
         .collect()
 }
 
+/// Where registry sources land in debug info and panic paths: the same place
+/// the base `<CARGO_HOME>` remap puts them, which samply resolves to crates.io.
+const REGISTRY_REMAP_TARGET: &str = "/kache/.cargo/registry/src";
+
 fn push_registry_dir(
     dirs: &mut std::collections::BTreeSet<(usize, String, String)>,
     root_slash: &str,
@@ -2055,9 +2163,9 @@ fn push_registry_dir(
         }
     }
     let to = if rel_dir.is_empty() {
-        "/cargo/registry/".to_string()
+        format!("{REGISTRY_REMAP_TARGET}/")
     } else {
-        format!("/cargo/registry/{rel_dir}/")
+        format!("{REGISTRY_REMAP_TARGET}/{rel_dir}/")
     };
     dirs.insert((from.len(), from, to));
 }
@@ -2158,20 +2266,6 @@ pub(crate) fn publish_host_neutral_decision(args: &RustcArgs, remaps: Option<Vec
     });
 }
 
-pub(crate) fn publish_host_neutral_plan(
-    args: &RustcArgs,
-    emitted: bool,
-    root: Option<&Path>,
-    sources: &[PathBuf],
-) {
-    if emitted {
-        return;
-    }
-    let remaps =
-        root.map(|root| registry_directory_remaps(root, sources, std::path::MAIN_SEPARATOR));
-    publish_host_neutral_decision(args, remaps);
-}
-
 pub(crate) fn take_host_neutral_decision(args: &RustcArgs) -> HostNeutralDecision {
     let (Some(crate_name), Some(source_file)) =
         (args.crate_name.as_deref(), args.source_file.as_deref())
@@ -2202,11 +2296,148 @@ pub(crate) fn host_neutral_extra_remaps(decision: HostNeutralDecision) -> Option
 
 /// Remaps for this compile. Skipping remap does not consume a plan that
 /// belongs to a later compile of the same unit.
+///
+/// A compile that starts before its key has no plan. It repeats what an
+/// earlier compile of the unit applied, or else takes the remaps of its whole
+/// registry package, so the key its emitted closure gets can match a key
+/// computed before compiling.
 pub(crate) fn take_execute_remaps(args: &RustcArgs, skip_remap: bool) -> Option<Vec<String>> {
     if skip_remap {
+        record_compiled_remaps(args, None);
         return None;
     }
-    host_neutral_extra_remaps(take_host_neutral_decision(args))
+    let remaps = match take_host_neutral_decision(args) {
+        HostNeutralDecision::Unknown => match compiled_remaps(args) {
+            Some(applied) => applied,
+            None => provisional_registry_remaps(args),
+        },
+        decision => host_neutral_extra_remaps(decision),
+    };
+    record_compiled_remaps(args, remaps.clone());
+    remaps
+}
+
+/// Most entries a package walk reads. Every key of a registry unit walks its
+/// package, cache hits included; a larger package compiles without registry
+/// remaps in every lane. About 99% of crates.io packages are smaller.
+const MAX_PACKAGE_ENTRIES: usize = 1024;
+
+struct CompiledRemaps {
+    crate_name: String,
+    source_file: PathBuf,
+    remaps: Option<Vec<String>>,
+}
+
+thread_local! {
+    static COMPILED_REMAPS: RefCell<Option<CompiledRemaps>> = const { RefCell::new(None) };
+}
+
+fn record_compiled_remaps(args: &RustcArgs, remaps: Option<Vec<String>>) {
+    let (Some(crate_name), Some(source_file)) =
+        (args.crate_name.as_deref(), args.source_file.as_deref())
+    else {
+        return;
+    };
+    COMPILED_REMAPS.with(|cell| {
+        *cell.borrow_mut() = Some(CompiledRemaps {
+            crate_name: crate_name.to_string(),
+            source_file: source_file.to_path_buf(),
+            remaps,
+        });
+    });
+}
+
+/// What the last compile of this unit applied, when one ran here.
+fn compiled_remaps(args: &RustcArgs) -> Option<Option<Vec<String>>> {
+    let (Some(crate_name), Some(source_file)) =
+        (args.crate_name.as_deref(), args.source_file.as_deref())
+    else {
+        return None;
+    };
+    COMPILED_REMAPS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|seen| seen.crate_name == crate_name && seen.source_file == source_file)
+            .map(|seen| seen.remaps.clone())
+    })
+}
+
+/// The registry remaps the compile that emitted this unit's closure applied.
+pub(crate) fn applied_registry_remaps(args: &RustcArgs) -> Option<Vec<String>> {
+    compiled_remaps(args).flatten()
+}
+
+/// Whether `applied` holds every remap a key-first compile of this closure
+/// would pass. Only then did each source take the same remap.
+pub(crate) fn remaps_cover_closure(
+    registry: &Path,
+    sources: &[PathBuf],
+    applied: &[String],
+) -> bool {
+    let applied: std::collections::HashSet<&str> = applied.iter().map(String::as_str).collect();
+    registry_directory_remaps(registry, sources, std::path::MAIN_SEPARATOR)
+        .iter()
+        .all(|remap| applied.contains(remap.as_str()))
+}
+
+/// Registry remaps for every directory of the unit's package, for a compile
+/// that starts before its closure is known. Extra directories change nothing
+/// rustc writes: each path still takes its deepest directory's remap.
+pub(crate) fn provisional_registry_remaps(args: &RustcArgs) -> Option<Vec<String>> {
+    let (registry, manifest_dir) = registry_remap_unit(args)?;
+    let placeholders: Vec<PathBuf> = package_directories(&manifest_dir, MAX_PACKAGE_ENTRIES)?
+        .into_iter()
+        .map(|dir| dir.join("_"))
+        .collect();
+    Some(registry_directory_remaps(
+        &registry,
+        &placeholders,
+        std::path::MAIN_SEPARATOR,
+    ))
+}
+
+/// `(registry/src, package)` for a unit that compiles with registry remaps
+/// in every lane: a registry package that is not a build script or
+/// proc-macro, has no `OUT_DIR` and no dylib extern. Whether its key is also
+/// host-neutral depends on the closure.
+pub(crate) fn registry_remap_unit(args: &RustcArgs) -> Option<(PathBuf, PathBuf)> {
+    if args.skip_path_remap()
+        || !unit_can_publish_remaps(args.crate_name.as_deref(), args.source_file.as_deref())
+        || args.crate_name.as_deref() == Some("build_script_build")
+        || args.crate_types.iter().any(|ty| ty == "proc-macro")
+        || has_dylib_extern(&args.externs)
+    {
+        return None;
+    }
+    let env = args.invocation_env();
+    if env.var_os("OUT_DIR").is_some() {
+        return None;
+    }
+    let manifest_dir = PathBuf::from(env.var_os("CARGO_MANIFEST_DIR")?);
+    let registry = registry_src_root(&manifest_dir)?.to_path_buf();
+    Some((registry, manifest_dir))
+}
+
+/// `root` and every directory below it, without following links. `None`
+/// past `limit` entries read or on any read error.
+fn package_directories(root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
+    let mut found = vec![root.to_path_buf()];
+    let mut next = 0;
+    let mut read = 0;
+    while let Some(dir) = found.get(next).cloned() {
+        next += 1;
+        for entry in std::fs::read_dir(&dir).ok()? {
+            read += 1;
+            if read > limit {
+                return None;
+            }
+            let entry = entry.ok()?;
+            if entry.file_type().ok()?.is_dir() {
+                found.push(entry.path());
+            }
+        }
+    }
+    Some(found)
 }
 
 /// Identity of an explicit native search directory an rlib can bundle from.
@@ -3053,6 +3284,9 @@ pub(crate) struct WorkspaceRoots {
     /// The package directory, for a vendored package ([`is_vendored_package`]):
     /// its guard is the package, not the workspace.
     pub(crate) vendored_package: Option<PathBuf>,
+    /// Directory names the workspace guard leaves out at any depth
+    /// ([`workspace_guard_excluded`]).
+    pub(crate) guard_excluded: Vec<std::ffi::OsString>,
 }
 
 impl WorkspaceRoots {
@@ -3139,9 +3373,55 @@ fn workspace_roots_in(
             .map(|path| joined_under(Some(current_dir), Path::new(path))),
         vendored_package: vendored_source(args, manifest_dir, current_dir)
             .then(|| manifest_dir.to_path_buf()),
+        guard_excluded: workspace_guard_excluded(&root),
         root,
         target,
     })
+}
+
+/// The directory names `[workspace] guard_exclude` lists in the `.kache.toml`
+/// at the workspace root. The file is part of the tree the guard digests, so
+/// two checkouts whose guards match leave out the same names.
+///
+/// Leaving a directory out is the project's promise that nothing reads it
+/// while Rust compiles, which Kache cannot check. A closure that names a file
+/// there keeps no guard ([`guard_covers`]), but an unreported read there goes
+/// unseen.
+/// Empty when the file is missing or the setting is not a list of plain
+/// names, so the guard then reads the whole tree.
+fn workspace_guard_excluded(root: &Path) -> Vec<std::ffi::OsString> {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Envelope {
+        workspace: Option<Section>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Section {
+        guard_exclude: Vec<String>,
+    }
+    let Ok(text) = std::fs::read_to_string(root.join(".kache.toml")) else {
+        return Vec::new();
+    };
+    let names = match toml::from_str::<Envelope>(&text) {
+        Ok(envelope) => envelope.workspace.unwrap_or_default().guard_exclude,
+        Err(_) => return Vec::new(),
+    };
+    let plain = |name: &str| {
+        !name.contains(['/', '\\'])
+            && matches!(
+                Path::new(name).components().collect::<Vec<_>>().as_slice(),
+                [std::path::Component::Normal(_)]
+            )
+    };
+    if !names.iter().all(|name| plain(name)) {
+        tracing::warn!(
+            "ignoring [workspace] guard_exclude in {}: each entry must be one directory name",
+            root.join(".kache.toml").display()
+        );
+        return Vec::new();
+    }
+    names.into_iter().map(Into::into).collect()
 }
 
 /// Rows of workspace and path units, filed under an identity with the
@@ -3322,6 +3602,7 @@ fn ancestor_top_digest(directory: &Path, file_hasher: &FileHasher<'_>) -> Option
         path: directory.to_path_buf(),
         role: b"ancestor".to_vec(),
         excluded: vec![directory.join(".git")],
+        excluded_dirs: Vec::new(),
         rules: crate::tree_stamp::StampRules {
             link_text: true,
             skip_build_dirs: false,
@@ -3409,8 +3690,11 @@ fn workspace_tree_digest_within(
         suffix_within(workspace.target.as_os_str(), &workspace.root, 0).unwrap_or_default();
     let target = target.trim_start_matches(['/', '\\']);
     let skipped = [target, ".git"];
-    let mut roots =
-        vec![TreeRoot::new(workspace.root.clone(), b"workspace", &skipped).skipping_build_dirs()];
+    let mut roots = vec![
+        TreeRoot::new(workspace.root.clone(), b"workspace", &skipped)
+            .skipping_build_dirs()
+            .excluding_dirs(&workspace.guard_excluded),
+    ];
     if let Some(out_dir) = &workspace.out_dir {
         roots.push(TreeRoot::new(out_dir.clone(), b"out_dir", &[]));
     }
@@ -3614,6 +3898,19 @@ fn executable_pdb_admission(args: &RustcArgs, rustc_version: &str, custom_target
                 .is_none_or(|target| target.split('-').any(|part| part == "windows")))
 }
 
+/// Whether this executable's entry stores a macOS `.dSYM`. Since
+/// kunobi-ninja/kache#1905 it is stored file by file. An older client would
+/// restore such an entry without its bundle, and its own entries hold a
+/// `.dsym.tar` this layout replaces, so these executables take a key
+/// namespace of their own. Other executables keep their keys.
+fn macos_debug_bundle_admission(args: &RustcArgs, target: Option<&str>) -> bool {
+    args.is_user_facing_executable()
+        && args.emits_link()
+        && args.debuginfo_enabled()
+        && args.get_codegen_opt("split-debuginfo") != Some("off")
+        && target.is_some_and(|target| target.contains("-apple-"))
+}
+
 /// Compute the blake3 cache key for a rustc invocation, with what the
 /// computation learned on the way ([`KeyOutputs`]).
 ///
@@ -3715,6 +4012,14 @@ fn compute_key_into(
     // stay in this position: configured roots, then the version, then clippy.
     let rustc_version = get_rustc_version_for(&args.rustc, invocation)?;
     let emitted = dep_info_provided();
+    // A registry unit compiles with the remaps of its whole package in every
+    // lane, and its key carries their namespace. An emitted closure follows
+    // what its compile applied; a key-first one, what its compile will.
+    let remap_set = if emitted {
+        applied_registry_remaps(args)
+    } else {
+        provisional_registry_remaps(args)
+    };
     let dep_info = resolve_key_inputs(args, file_hasher, crate_name, env, out)?;
     // Hand the closure back to the wrapper, which records it as a prediction
     // only once the invocation it belongs to has succeeded. The clone is one
@@ -3728,21 +4033,28 @@ fn compute_key_into(
         .as_ref()
         .map(|info| info.source_files.as_slice())
         .unwrap_or(&[]);
-    let host_neutral_root = applicable_host_neutral_root(
-        emitted,
-        unit_can_publish_remaps(args.crate_name.as_deref(), args.source_file.as_deref()),
-        &UnitClosure {
-            crate_name: args.crate_name.as_deref(),
-            crate_types: &args.crate_types,
-            externs: &args.externs,
-            sources,
-            manifest_dir: manifest_dir.as_deref(),
-            out_dir: out_dir.as_deref().map(Path::new),
-            skip_remap: args.skip_path_remap(),
-        },
-    );
-    let (drop_host, namespace) = version_flags_for_unit(host_neutral_root.is_some());
-    publish_host_neutral_plan(args, emitted, host_neutral_root.as_deref(), sources);
+    // Host-neutral only where those remaps reach every source.
+    let host_neutral_root = remap_set.as_deref().and_then(|remaps| {
+        applicable_host_neutral_root(
+            false,
+            unit_can_publish_remaps(args.crate_name.as_deref(), args.source_file.as_deref()),
+            &UnitClosure {
+                crate_name: args.crate_name.as_deref(),
+                crate_types: &args.crate_types,
+                externs: &args.externs,
+                sources,
+                manifest_dir: manifest_dir.as_deref(),
+                out_dir: out_dir.as_deref().map(Path::new),
+                skip_remap: args.skip_path_remap(),
+            },
+        )
+        .filter(|root| remaps_cover_closure(root, sources, remaps))
+    });
+    let (drop_host, namespace) =
+        host_neutral_version_flags(host_neutral_root.is_some(), remap_set.is_some());
+    if !emitted {
+        publish_host_neutral_decision(args, remap_set);
+    }
     hash_rustc_version_for_unit(&mut hasher, &rustc_version, drop_host, namespace);
     tracing::trace!(
         "[key:{}] rustc_version={}",
@@ -3825,6 +4137,10 @@ fn compute_key_into(
     if executable_pdb_admission(args, &rustc_version, custom_target) {
         hasher.set_group("pe_pdb_admission");
         fold_field(&mut hasher, b"executable_pdb_pairing.v1:", b"verified");
+    }
+    if macos_debug_bundle_admission(args, compiler_target) {
+        hasher.set_group("debug_bundle_layout");
+        fold_field(&mut hasher, b"debug_bundle_layout.v2:", b"per-file");
     }
 
     // crate identity
@@ -7542,7 +7858,14 @@ fn guard_covers(sources: &[PathBuf], workspace: &WorkspaceRoots) -> bool {
     let mut entered = HashMap::new();
     sources.iter().all(|source| {
         guard_place(source, workspace).is_some_and(|(root, below, skips_build_dirs)| {
-            walk_reaches(root, &below, skips_build_dirs, &mut entered)
+            // Only the workspace walk, the one that skips build dirs, leaves
+            // directory names out.
+            let excluded: &[std::ffi::OsString] = if skips_build_dirs {
+                &workspace.guard_excluded
+            } else {
+                &[]
+            };
+            walk_reaches(root, &below, skips_build_dirs, excluded, &mut entered)
         })
     })
 }
@@ -7569,12 +7892,14 @@ fn guard_place<'a>(
 
 /// Does a walk from `root` that follows no symlink reach the file at
 /// `below`, a lexical path inside `root`? With `skips_build_dirs`, not
-/// through a directory Cargo tagged as its build directory either.
+/// through a directory Cargo tagged as its build directory either, and never
+/// through one named in `excluded_dirs` ([`names_guard_excluded`]).
 /// `entered` keeps the answer for each directory checked.
 fn walk_reaches(
     root: &Path,
     below: &str,
     skips_build_dirs: bool,
+    excluded_dirs: &[std::ffi::OsString],
     entered: &mut HashMap<(PathBuf, bool), bool>,
 ) -> bool {
     use std::path::Component;
@@ -7595,6 +7920,9 @@ fn walk_reaches(
             depth = up;
             directory.pop();
             continue;
+        }
+        if names_guard_excluded(component.as_os_str(), excluded_dirs) {
+            return false;
         }
         directory.push(component);
         depth += 1;
@@ -8178,6 +8506,21 @@ struct RecentHash {
     hash: String,
     fingerprint: Option<FileFingerprint>,
 }
+
+/// The smallest key input whose hash [`FileHasher::hash`] memoises (other
+/// reads, such as a tree guard's, keep [`MIN_PERSISTED_HASH_BYTES`]). Off
+/// Windows a small file is read about as fast as its memo row is looked up,
+/// so only files of [`MIN_PERSISTED_HASH_BYTES`] and more get rows. On
+/// Windows every key input with a strong stamp does: reading one opens it
+/// for its data, which an antivirus filter may scan, while the stamp the
+/// memo needs comes from an attribute-only open. A warm build of a
+/// 1,200-unit desktop app read about 20,500 small sources per build on a 4
+/// vCPU Windows 11 VM.
+const SOURCE_MEMO_MIN_BYTES: i64 = if cfg!(windows) {
+    0
+} else {
+    MIN_PERSISTED_HASH_BYTES
+};
 
 /// [`hash_file`], for a read that follows a stat of the same file.
 fn read_file_hash(path: &Path) -> Result<String> {
@@ -9292,9 +9635,9 @@ impl<'db> FileHasher<'db> {
     /// the input was observed moves on any later write. One taken sooner can
     /// survive a second write in the same timestamp tick, so the input is
     /// recorded by content alone and every lookup compares that content. For
-    /// a file of 64 KiB or more the comparison goes through the file-hash
-    /// memo, which answers by stamp, so it is only as fresh as that memo's
-    /// rows. Refusing the record instead would keep a fresh checkout from
+    /// a file of [`SOURCE_MEMO_MIN_BYTES`] or more (any size on Windows) the
+    /// comparison goes through the file-hash memo, which answers by stamp, so
+    /// it is only as fresh as that memo's rows. Refusing the record instead would keep a fresh checkout from
     /// memoising anything.
     pub(crate) fn cc_preprocess_memo_record_if_unchanged(
         &self,
@@ -9845,7 +10188,12 @@ impl<'db> FileHasher<'db> {
             self.note_too_new(fingerprint);
         }
 
-        if fingerprint.size < MIN_PERSISTED_HASH_BYTES
+        let memo_floor = if keyed {
+            SOURCE_MEMO_MIN_BYTES
+        } else {
+            MIN_PERSISTED_HASH_BYTES
+        };
+        if fingerprint.size < memo_floor
             || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
         {
             let hash = read_file_hash(path)?;
@@ -10078,8 +10426,8 @@ impl<'db> FileHasher<'db> {
         };
         self.note_too_new(&fingerprint);
 
-        // Small libs skip the persistent cache (same policy as `hash`); the
-        // archive read is cheap and not worth a row.
+        // Small libs skip the persistent cache (the floor `hash` keeps off
+        // Windows); the archive read is cheap and not worth a row.
         let size = fingerprint.size;
         if size < MIN_PERSISTED_HASH_BYTES
             || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))

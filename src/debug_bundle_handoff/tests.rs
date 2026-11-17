@@ -416,7 +416,7 @@ fn request(config: &Config, staging: &Path) -> PublishRustcDebugRequest {
             },
         ],
         executable: "bin/demo-1234".to_string(),
-        bundle_store_name: "demo-1234.dsym.tar".to_string(),
+        bundle_stem: "demo-1234".to_string(),
         installed_executable: handoff_dir(config)
             .join("../../target/demo-1234")
             .to_string_lossy()
@@ -453,13 +453,9 @@ fn only_a_sound_request_validates() {
         }),
         ("escaping file", |r| r.files[1].path = "../x".to_string()),
         ("executable", |r| r.executable = "bin/other".to_string()),
-        ("empty bundle", |r| r.bundle_store_name.clear()),
-        ("nested bundle", |r| {
-            r.bundle_store_name = "a/b.tar".to_string()
-        }),
-        ("windows bundle", |r| {
-            r.bundle_store_name = "a\\b.tar".to_string()
-        }),
+        ("empty bundle", |r| r.bundle_stem.clear()),
+        ("nested bundle", |r| r.bundle_stem = "a/b".to_string()),
+        ("windows bundle", |r| r.bundle_stem = "a\\b".to_string()),
         ("relative install", |r| {
             r.installed_executable = "target/demo".to_string();
         }),
@@ -1046,7 +1042,7 @@ fn the_daemon_runs_the_builds_dsymutil_in_the_builds_environment() {
 
 #[cfg(unix)]
 #[test]
-fn a_job_builds_installs_and_tars_the_bundle() {
+fn a_job_builds_installs_and_stages_the_bundle_file_by_file() {
     let fixture = make_fixture(OBJECTS);
     let config = fixture_config(&fixture);
     let job = accepted_job(&fixture, &config);
@@ -1055,7 +1051,16 @@ fn a_job_builds_installs_and_tars_the_bundle() {
 
     let files = entry_files(&job, &fake_dsymutil, NO_TIMEOUT, &RUNNING).unwrap();
     let names: Vec<_> = files.iter().map(|(_, name)| name.as_str()).collect();
-    assert_eq!(names, ["demo-1234", "demo-1234.d", "demo-1234.dsym.tar"]);
+    assert_eq!(
+        names,
+        [
+            "demo-1234",
+            "demo-1234.d",
+            "demo-1234.dsym.json",
+            "demo-1234.dsym.0",
+            "demo-1234.dsym.1"
+        ]
+    );
     assert!(files.iter().all(|(path, _)| path.starts_with(&job.dir)));
 
     let bundle = fixture.profile.join("deps/demo-1234.dSYM");
@@ -1076,26 +1081,24 @@ fn a_job_builds_installs_and_tars_the_bundle() {
         assert_eq!(mode & 0o777, 0o755);
     }
 
-    let mut archive = tar::Archive::new(std::fs::File::open(&files[2].0).unwrap());
-    let mut entries: Vec<_> = archive
-        .entries()
-        .unwrap()
-        .map(|entry| {
-            entry
-                .unwrap()
-                .path()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    entries.sort();
+    // The manifest maps each stored file back to its path in the bundle, and
+    // each file holds what was placed next to the executable.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&files[2].0).unwrap()).unwrap();
     assert_eq!(
-        entries,
-        [
-            "Contents/Resources/DWARF/demo-1234",
-            "Contents/Resources/Relocations/aarch64/demo-1234.yml"
-        ]
+        manifest["files"],
+        serde_json::json!([
+            {"path": "Contents/Resources/DWARF/demo-1234", "name": "demo-1234.dsym.0"},
+            {
+                "path": "Contents/Resources/Relocations/aarch64/demo-1234.yml",
+                "name": "demo-1234.dsym.1"
+            }
+        ])
+    );
+    assert_eq!(std::fs::read(&files[3].0).unwrap(), b"object a");
+    assert_eq!(
+        std::fs::read(&files[4].0).unwrap(),
+        std::fs::read(installed.join("Relocations/aarch64/demo-1234.yml")).unwrap()
     );
 }
 
@@ -1238,7 +1241,16 @@ fn a_processed_job_stores_one_entry_and_removes_its_directory() {
     let meta = store.get(&key("demo")).unwrap().expect("stored");
     let mut names: Vec<_> = meta.files.iter().map(|file| file.name.as_str()).collect();
     names.sort();
-    assert_eq!(names, ["demo-1234", "demo-1234.d", "demo-1234.dsym.tar"]);
+    assert_eq!(
+        names,
+        [
+            "demo-1234",
+            "demo-1234.d",
+            "demo-1234.dsym.0",
+            "demo-1234.dsym.1",
+            "demo-1234.dsym.json"
+        ]
+    );
 
     // The key is committed now: a second job leaves it to the first.
     let job = accepted_job(&fixture, &config);
@@ -1733,10 +1745,22 @@ fn a_deferred_bundle_matches_the_synchronous_one_and_resolves_lines() {
     std::fs::copy(&binary, &uplifted).unwrap();
 
     let sync_staging = tempfile::tempdir().unwrap();
-    let sync_tar = crate::compiler::platform::MacOsPlatform::default()
+    let sync_bundle: Vec<_> = crate::compiler::platform::MacOsPlatform::default()
         .package_debug_bundle(&binary, sync_staging.path(), Some("unpacked"))
         .unwrap()
-        .expect("the synchronous path packages a bundle");
+        .expect("the synchronous path packages a bundle")
+        .into_artifacts()
+        .into_iter()
+        .map(|artifact| (artifact.store_name, std::fs::read(&artifact.path).unwrap()))
+        .collect();
+    let sync_hashes: Vec<_> = std::fs::read_dir(sync_staging.path())
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, crate::cache_key::hash_file(&path).unwrap())
+        })
+        .collect();
     let installed_bundle = deps.join("hello-0123456789abcdef.dSYM");
     std::fs::remove_dir_all(&installed_bundle).unwrap();
 
@@ -1769,11 +1793,14 @@ fn a_deferred_bundle_matches_the_synchronous_one_and_resolves_lines() {
     let dir = take_staging(&handoff_dir(&config), &capture.dir).unwrap();
     let job = DebugBundleJob { request, dir, uuid };
 
-    let deferred_tar = build_bundle(&job, &dsymutil_command, NO_TIMEOUT, &RUNNING).unwrap();
+    let deferred_bundle: Vec<_> = build_bundle(&job, &dsymutil_command, NO_TIMEOUT, &RUNNING)
+        .unwrap()
+        .into_iter()
+        .map(|(path, name)| (name, std::fs::read(path).unwrap()))
+        .collect();
     assert_eq!(
-        std::fs::read(&deferred_tar).unwrap(),
-        std::fs::read(&sync_tar).unwrap(),
-        "deferred and synchronous bundles are the same bytes"
+        deferred_bundle, sync_bundle,
+        "deferred and synchronous bundles are the same names and bytes"
     );
 
     let store = Store::open(&config).unwrap();
@@ -1783,12 +1810,15 @@ fn a_deferred_bundle_matches_the_synchronous_one_and_resolves_lines() {
         JobOutcome::Stored
     );
     let meta = store.get(&cache_key).unwrap().expect("stored");
-    let tar = meta
-        .files
-        .iter()
-        .find(|file| file.name == "hello-0123456789abcdef.dsym.tar")
-        .expect("the bundle is part of the entry");
-    assert_eq!(tar.hash, crate::cache_key::hash_file(&sync_tar).unwrap());
+    assert_eq!(sync_hashes.len(), sync_bundle.len());
+    for (name, hash) in &sync_hashes {
+        let stored = meta
+            .files
+            .iter()
+            .find(|file| &file.name == name)
+            .unwrap_or_else(|| panic!("{name} is part of the entry"));
+        assert_eq!(&stored.hash, hash, "{name}");
+    }
     assert!(
         std::fs::read_dir(handoff_dir(&config))
             .unwrap()

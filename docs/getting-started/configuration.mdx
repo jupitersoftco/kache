@@ -140,7 +140,7 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_CLEAN_ORPHANED_TARGETS` | `cache.auto_clean_orphaned_targets` | `true` | Let the daemon remove target directories whose workspace was deleted. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_SHARE_TARGET_FILES` | `cache.auto_share_target_files` | `true` | Let the daemon replace target files that are full copies of stored blobs with clones of those blobs. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` | `cache.auto_clean_idle_targets_days` | `0` | Let the daemon also remove target directories no build has used for this many days; `0` disables it |
-| `KACHE_RESTORE_MAX_SIZE` | `cache.restore_max_size` | `8GiB` | Positive per-entry limit for compressed remote downloads, extracted remote files and unpacked debug bundles. Oversized entries fall back to compilation. Restart the daemon after changing it. |
+| `KACHE_RESTORE_MAX_SIZE` | `cache.restore_max_size` | `8GiB` | Positive per-entry limit for compressed remote downloads, extracted remote files and restored debug bundles. Oversized entries fall back to compilation. Restart the daemon after changing it. |
 | `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` | `cache.auto_recover_min_free_bytes` | `10GiB`; `0` in CI | Below this many free bytes, builds evict eligible cache entries; `0` disables recovery. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_RECOVER_TARGETS` | `cache.auto_recover_targets` | `false` | Below the free-space floor, also remove idle target directories when the machine is quiet. `kache init` offers to turn it on. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_TARGET_LIVENESS` | `cache.target_liveness` | `false` | Record successful Cargo build/check commands for exact-scope unit cleanup; see [Recorded-command cleanup](#recorded-command-cleanup). |
@@ -324,6 +324,7 @@ The equivalent environment setting is `KACHE_READONLY_STORE=/kache-host`. The va
 - Kache skips index writes, hit stamps and maintenance there. A damaged or legacy entry is a miss. A rejected hit compiles and caches in your own writable store.
 - Its owner must keep the WAL side files available. A WAL-mode index without `index.db-wal` and `index.db-shm` is skipped with a warning. A read-only mount is required to prevent SQLite from creating side files if the owner removes them during an open. The connection alone cannot enforce that protection on a writable mount.
 - With a read-only store set, a unit with no record in the local store is keyed before it compiles, so it can still hit there.
+- `kache stats` and `kache report` count its hits as local hits and also report them on their own as `readonly_hits`, so you can see how much of the local hit count the shared store served. Hits logged by older versions of kache are not marked.
 
 The read-only path is used as configured. `KACHE_TRUST_DOMAIN` isolates your writable store and runtime, but does not change this path. Mount a store that the job is allowed to read for its trust domain.
 
@@ -647,6 +648,19 @@ propagate_to_dependents = true
 ```
 
 Workspace rules are accepted only from the `.kache.toml` beside the active Cargo workspace manifest. After adding a declaration to a target Cargo already considers fresh, rebuild that package once.
+
+## Tool output in the workspace
+
+Kache reuses a workspace crate's recorded inputs only while the workspace holds what the recording build saw (see [Rust key inputs](/docs/how-it-works/cache-key#rust-key-inputs)). Tools that write into the tree, such as pnpm installing `node_modules`, leave files that differ between checkouts. A new worktree then runs dependency discovery for every workspace crate, even when each crate then restores from the cache.
+
+Use it only for directories that nothing reads while Rust compiles: no proc macro, build script or `include_str!`-style macro opens, lists or scans anything in them. List such a directory in the `.kache.toml` at the workspace root:
+
+```toml title=".kache.toml"
+[workspace]
+guard_exclude = ["node_modules"]
+```
+
+Each entry is a directory name, left out at any depth below the workspace root and matched without ASCII case. Kache cannot check that the directory is unread. If something does read it, a change there can go unseen and a crate can restore a result built from the old files. For example, a proc macro that reads a config file in the directory without reporting it, and picks which other files to include from it, keeps its old result when that config file changes. A crate whose recorded inputs name a file in a left-out directory keeps running dependency discovery, but most reads are not recorded that way. Kache ignores the whole list when any entry is not a single name, such as `web/node_modules`.
 
 ## Remote settings
 
