@@ -2,7 +2,8 @@
 //!
 //! An unchanged checkout checks the artifact cache. After a build of a Cargo unit (a
 //! hit or a miss) and a later miss in the same target where only
-//! source/extern key groups changed, however far apart, the miss may seed a
+//! source/extern key groups changed (with any env or build-script groups that
+//! follow an edit), however far apart, the miss may seed a
 //! private incremental directory. Successful seeds enable a small, time-bounded run
 //! of early passthroughs before Kache probes the cache again. A run ends early
 //! when the unit's sources move back to the last state that went through the
@@ -1112,6 +1113,12 @@ impl KeyFingerprint {
     }
 }
 
+/// Key groups a build script can derive from the unit's own sources: a
+/// script that reruns on every edit and stamps a digest of `src/` into
+/// `cargo:rustc-env` moves both on each edit. They belong to neither part, so
+/// they may move with an edit but never qualify a pair on their own.
+const SOURCE_DERIVED_GROUPS: [&str; 2] = ["env_deps", "build_script_inputs"];
+
 /// Split Kache's grouped key digests into stable and mutation-varying parts.
 /// Missing/empty grouped data is not evidence and therefore cannot teach the
 /// automatic policy.
@@ -1132,6 +1139,8 @@ pub(crate) fn key_fingerprint(
         let target = if matches!(name.as_str(), "sources" | "externs") {
             dynamic_count += 1;
             &mut dynamic
+        } else if SOURCE_DERIVED_GROUPS.contains(&name.as_str()) {
+            continue;
         } else {
             stable_count += 1;
             &mut stable
@@ -1149,9 +1158,10 @@ pub(crate) fn key_fingerprint(
     })
 }
 
-/// Two misses of one unit that differ only in its sources or dependencies:
-/// someone is editing it. The gap between them does not matter; a person
-/// takes minutes between edits.
+/// Two misses of one unit whose sources or dependencies differ and whose
+/// stable groups do not: someone is editing it. Groups the edit itself can
+/// move ([`SOURCE_DERIVED_GROUPS`]) may differ too. The gap between them does
+/// not matter; a person takes minutes between edits.
 fn qualifying_pair(previous: &Observation, current: &KeyFingerprint) -> bool {
     previous.cache_key != current.cache_key
         && previous.stable == current.stable
@@ -3776,6 +3786,89 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Key fields of a unit whose build script stamps a digest of its
+    /// sources into `cargo:rustc-env`: the stamp moves both source-derived
+    /// groups.
+    fn stamped(sources: &str, stamp: &str) -> BTreeMap<String, String> {
+        let mut grouped = fields("stable", sources, "extern-a");
+        grouped.insert("env_deps".into(), stamp.into());
+        grouped.insert("build_script_inputs".into(), stamp.into());
+        grouped
+    }
+
+    #[test]
+    fn source_derived_groups_may_move_with_an_edit_but_never_alone() {
+        let previous = key_fingerprint(&cache_key("first"), &stamped("source-a", "stamp-a"))
+            .unwrap()
+            .at(100);
+        let qualifies = |label: &str, grouped: &BTreeMap<String, String>| {
+            qualifying_pair(
+                &previous,
+                &key_fingerprint(&cache_key(label), grouped).unwrap(),
+            )
+        };
+        assert!(qualifies("edit", &stamped("source-b", "stamp-b")));
+        assert!(qualifies("unstamped edit", &stamped("source-b", "stamp-a")));
+        let mut dependency = stamped("source-a", "stamp-b");
+        dependency.insert("externs".into(), "extern-b".into());
+        assert!(qualifies("dependency", &dependency));
+
+        assert!(!qualifies("stamp only", &stamped("source-a", "stamp-b")));
+        for group in SOURCE_DERIVED_GROUPS {
+            let mut moved = stamped("source-a", "stamp-a");
+            moved.insert(group.into(), "stamp-b".into());
+            assert!(!qualifies(group, &moved), "{group}");
+        }
+        for group in ["args", "compiler", "env_cfg", "link"] {
+            let mut moved = stamped("source-b", "stamp-b");
+            moved.insert(group.into(), "changed".into());
+            assert!(!qualifies(group, &moved), "{group}");
+        }
+        assert!(
+            key_fingerprint(
+                &cache_key("derived"),
+                &BTreeMap::from([
+                    ("env_deps".to_string(), "stamp".to_string()),
+                    ("sources".to_string(), "source".to_string()),
+                ]),
+            )
+            .is_none(),
+            "a source-derived group is no stable group"
+        );
+    }
+
+    /// The repro of a crate whose build script stamps its source digest: the
+    /// first edit's cold seed qualifies, later edits run active, and an
+    /// active unit renews its seed on such an edit but not on the stamp alone.
+    #[test]
+    fn a_unit_whose_build_script_stamps_its_sources_activates() {
+        let (_temp, _args, unit) = fixture();
+        assert!(unit.observe_build_at(&cache_key("build"), &stamped("source-a", "stamp-a"), 100));
+        let mut lease = unit.try_deferred_seed().unwrap();
+        fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
+        assert!(lease.qualify_deferred_seed_at(
+            &cache_key("edit 1"),
+            &stamped("source-b", "stamp-b"),
+            101,
+        ));
+        assert!(lease.finish_at(CompileOutcome::Success, 102));
+        for at in [103, 105, 107] {
+            let lease = unit.try_active_at(at).expect("later edits run active");
+            assert!(lease.finish_at(CompileOutcome::Success, at + 1));
+        }
+
+        assert!(
+            unit.try_seed_at(&cache_key("stamp"), &stamped("source-b", "stamp-c"), 109)
+                .is_none()
+        );
+        assert_eq!(read_state(&unit).phase, Phase::Active);
+        let renewed = unit
+            .try_seed_at(&cache_key("edit 5"), &stamped("source-c", "stamp-c"), 110)
+            .expect("an active unit renews its seed on a stamped edit");
+        assert!(renewed.finish_at(CompileOutcome::Success, 111));
+        assert_eq!(read_state(&unit).phase, Phase::Active);
     }
 
     #[test]
