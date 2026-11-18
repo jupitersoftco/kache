@@ -100,7 +100,8 @@ const DEFERRED_GRAPH: &str = "rustc.deferred";
 /// A copy of the dep-info of the last build that went through the cache. A
 /// return to that build is judged by the files it read: the last private
 /// compile's dep-info lacks any a branch switch adds back. A state without
-/// this copy, such as one an older Kache wrote, never looks a return up.
+/// this copy, such as one an older Kache wrote, is judged by the unit's
+/// dep-info as that Kache did.
 const CACHED_DEP_INFO: &str = "cached-sources.d";
 
 struct DeferredGraph {
@@ -410,17 +411,17 @@ impl AdaptiveUnit {
     /// Content digest of the sources a dep-info names. It only decides
     /// whether an active unit looks up the cache; it never keys one.
     fn source_set_digest(&self, dep_info: &Path) -> Option<String> {
-        let dep_info = std::io::read_to_string(open_dep_info(dep_info)?).ok()?;
-        let sources = crate::cache_key::parse_dep_info(&dep_info);
+        self.sources_digest(&read_dep_info(dep_info)?)
+    }
+
+    /// [`Self::source_set_digest`] of dep-info text.
+    fn sources_digest(&self, dep_info: &str) -> Option<String> {
+        let sources = crate::cache_key::parse_dep_info(dep_info);
         // Contents only, sorted: a restore may spell the same paths differently.
         let mut contents = Vec::with_capacity(sources.len());
         let mut budget = MAX_SOURCE_BYTES;
         for source in sources {
-            let path = if source.is_absolute() {
-                source
-            } else {
-                self.invocation_cwd.as_ref()?.join(source)
-            };
+            let path = self.resolve(source)?;
             // A file the cached build read and a branch switch deleted drops
             // out, so the digest no longer matches that build.
             let mut input = match File::open(&path) {
@@ -451,22 +452,84 @@ impl AdaptiveUnit {
         Some(hash.finalize().to_hex().to_string())
     }
 
-    /// Copy the unit's dep-info to [`CACHED_DEP_INFO`] after a build that
-    /// went through the cache, and return the copy's source digest.
-    fn record_cached_sources(&self) -> Option<String> {
-        let dep_info = std::io::read_to_string(open_dep_info(self.dep_info.as_ref()?)?).ok()?;
-        let copy = self.cached_dep_info();
-        if unsafe_file(&copy)
-            || crate::atomic::atomic_replace_deferrable(&copy, dep_info.as_bytes(), false).is_err()
-        {
-            return None;
+    /// A dep-info path relative to the compiler's working directory.
+    fn resolve(&self, source: PathBuf) -> Option<PathBuf> {
+        if source.is_absolute() {
+            Some(source)
+        } else {
+            Some(self.invocation_cwd.as_ref()?.join(source))
         }
-        self.source_set_digest(&copy)
     }
 
-    /// The digest of [`CACHED_DEP_INFO`]'s sources as they are now.
+    /// Copy the unit's dep-info to [`CACHED_DEP_INFO`] after a build that
+    /// went through the cache, and return its source digest. A copy that
+    /// already holds it is left alone; without a dep-info there is no copy.
+    fn record_cached_sources(&self) -> Option<String> {
+        let copy = self.cached_dep_info();
+        let recorded = self
+            .dep_info
+            .as_deref()
+            .and_then(read_dep_info)
+            .filter(|dep_info| {
+                !unsafe_file(&copy)
+                    && (read_dep_info(&copy).as_ref() == Some(dep_info)
+                        || crate::atomic::atomic_replace_deferrable(
+                            &copy,
+                            dep_info.as_bytes(),
+                            false,
+                        )
+                        .is_ok())
+            });
+        match recorded {
+            Some(dep_info) => self.sources_digest(&dep_info),
+            None => {
+                remove_path_safely(&copy);
+                None
+            }
+        }
+    }
+
+    /// The digest of [`CACHED_DEP_INFO`]'s sources as they are now, or of
+    /// the unit's dep-info for a state an older Kache left without a copy.
     fn cached_source_set_digest(&self) -> Option<String> {
-        self.source_set_digest(&self.cached_dep_info())
+        let copy = self.cached_dep_info();
+        if definitely_missing(&copy) {
+            self.source_set_digest(self.dep_info.as_ref()?)
+        } else {
+            self.source_set_digest(&copy)
+        }
+    }
+
+    /// Whether the unit's last compile read a file that still exists and that
+    /// the cached build did not read, such as one a directory-scanning macro
+    /// picked up. Such sources are not the cached ones, whatever the cached
+    /// files hold. Anything unreadable counts as such a file.
+    fn reads_beyond_cached_sources(&self) -> bool {
+        let Some(cached) = read_dep_info(&self.cached_dep_info()) else {
+            // No copy: the digest already covered the unit's own dep-info.
+            return false;
+        };
+        let Some(last) = self.dep_info.as_deref().and_then(read_dep_info) else {
+            return false;
+        };
+        // Real paths: a restore may spell the same file differently.
+        let existing = |dep_info: &str| {
+            let mut files = std::collections::HashSet::new();
+            for source in crate::cache_key::parse_dep_info(dep_info) {
+                match fs::canonicalize(self.resolve(source)?) {
+                    Ok(path) => {
+                        files.insert(path);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return None,
+                }
+            }
+            Some(files)
+        };
+        match (existing(&cached), existing(&last)) {
+            (Some(cached), Some(last)) => !last.is_subset(&cached),
+            _ => true,
+        }
     }
 
     fn cached_dep_info(&self) -> PathBuf {
@@ -596,7 +659,11 @@ impl AdaptiveUnit {
             .cached_sources
             .as_ref()
             .and_then(|_| self.cached_source_set_digest());
-        if current.is_some() && current == state.cached_sources && current != state.last_sources {
+        if current.is_some()
+            && current == state.cached_sources
+            && current != state.last_sources
+            && !self.reads_beyond_cached_sources()
+        {
             return None;
         }
 
@@ -742,8 +809,9 @@ impl AdaptiveUnit {
 
         // A normal compile did not consume this private state. Clear it so a
         // future seed never starts from state associated with rejected stable
-        // fields, a failed process, or corrupt metadata.
-        if !reset_locked(self) {
+        // fields, a failed process, or corrupt metadata. The cached dep-info
+        // copy is replaced below.
+        if !reset_locked_but_cached_sources(self) {
             return false;
         }
         let learning = DiskState {
@@ -1071,10 +1139,11 @@ impl Lease {
             (Completion::DeferredSeed { previous }, _) => {
                 // Unqualified success stored no artifact. Clear learning while
                 // still holding the lock so the next build can store normally.
-                // A cancelled hit or failed compile retains the observation.
-                if reset_locked(&self.unit)
-                    && outcome != CompileOutcome::Success
-                    && !self.unit.store_state(&previous, true)
+                // A cancelled hit or failed compile retains the observation,
+                // and the cached dep-info its `cached_sources` was taken from.
+                if outcome == CompileOutcome::Success
+                    || (reset_locked_but_cached_sources(&self.unit)
+                        && !self.unit.store_state(&previous, true))
                 {
                     reset_locked(&self.unit);
                 }
@@ -1405,6 +1474,13 @@ fn strip_incremental_refs<'a>(args: impl IntoIterator<Item = &'a String>) -> Vec
 }
 
 fn reset_locked(unit: &AdaptiveUnit) -> bool {
+    reset_locked_but_cached_sources(unit) && remove_path_safely(&unit.cached_dep_info())
+}
+
+/// [`reset_locked`] for a caller that stores a state next, which may carry
+/// the `cached_sources` taken from [`CACHED_DEP_INFO`]: the copy stays. Only
+/// a state carrying its digest ever reads it.
+fn reset_locked_but_cached_sources(unit: &AdaptiveUnit) -> bool {
     if !remove_path_safely(&unit.unit_dir.join(worktree_seed::MARKER)) {
         return false;
     }
@@ -1423,7 +1499,6 @@ fn reset_locked(unit: &AdaptiveUnit) -> bool {
     }
     if !remove_path_safely(&unit.rustc_dir)
         || !remove_path_safely(&unit.unit_dir.join(DEFERRED_GRAPH))
-        || !remove_path_safely(&unit.cached_dep_info())
     {
         return false;
     }
@@ -1431,9 +1506,12 @@ fn reset_locked(unit: &AdaptiveUnit) -> bool {
 }
 
 /// A dep-info no larger than [`MAX_DEP_INFO_BYTES`].
-fn open_dep_info(path: &Path) -> Option<File> {
+fn read_dep_info(path: &Path) -> Option<String> {
     let dep_info = File::open(path).ok()?;
-    (dep_info.metadata().ok()?.len() <= MAX_DEP_INFO_BYTES).then_some(dep_info)
+    if dep_info.metadata().ok()?.len() > MAX_DEP_INFO_BYTES {
+        return None;
+    }
+    std::io::read_to_string(dep_info).ok()
 }
 
 fn remove_path_safely(path: &Path) -> bool {
@@ -3044,10 +3122,10 @@ mod tests {
     }
 
     /// A state with no copy of its cached dep-info, as an older Kache wrote
-    /// it, keeps the fast path instead of guessing a return. A reset removes
-    /// the copy with the state.
+    /// it, judges a return by the unit's dep-info as that Kache did. A reset
+    /// removes the copy with the state.
     #[test]
-    fn a_state_without_its_cached_dep_info_keeps_the_fast_path() {
+    fn a_state_without_its_cached_dep_info_is_judged_by_the_units_dep_info() {
         let (_temp, checkout, unit) = fixture_with_sources();
         teach(&unit, 100);
         check_out(&checkout, &[("src/a.rs", Some("edited"))]);
@@ -3055,13 +3133,146 @@ mod tests {
         fs::remove_file(unit.cached_dep_info()).unwrap();
 
         check_out(&checkout, &[("src/a.rs", Some("cached"))]);
-        let lease = unit.try_active_at(103).expect("no copy, no lookup");
-        assert!(lease.finish_at(CompileOutcome::Success, 104));
+        assert!(unit.try_active_at(103).is_none());
 
         teach(&unit, 105);
         assert!(unit.cached_dep_info().is_file());
         assert!(unit.reset());
         assert!(!path_exists(&unit.cached_dep_info()));
+    }
+
+    /// A failed deferred seed restores the learning state, and with it the
+    /// copy its cached digest was taken from, so a later return still looks
+    /// up the cache. rustc writes no dep-info for a syntax error.
+    #[test]
+    fn a_failed_deferred_seed_keeps_the_cached_dep_info() {
+        let (_temp, checkout, unit) = fixture_with_sources();
+        let edit = |text: &str| check_out(&checkout, &[("src/a.rs", Some(text))]);
+        teach(&unit, 100);
+        edit("syntax error");
+        let lease = unit.try_deferred_seed().unwrap();
+        assert!(!lease.finish_at(CompileOutcome::CompileError, 101));
+        assert!(unit.cached_dep_info().is_file());
+        assert!(read_state(&unit).cached_sources.is_some());
+
+        edit("first edit");
+        seed_from(&unit, &["src/lib.rs", "src/a.rs"], 102);
+        edit("second edit");
+        let lease = unit.try_active_at(104).expect("an edit runs active");
+        assert!(lease.finish_at(CompileOutcome::Success, 105));
+        edit("cached");
+        assert!(unit.try_active_at(106).is_none());
+
+        // An unqualified success clears learning, copy included.
+        teach(&unit, 107);
+        let lease = unit.try_deferred_seed().unwrap();
+        fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
+        assert!(!lease.finish_at(CompileOutcome::Success, 108));
+        assert!(!path_exists(&unit.cached_dep_info()));
+    }
+
+    /// A file the last compile read that the cached build did not, such as
+    /// one a directory-scanning macro found, means the sources are not the
+    /// cached ones even when every cached file matches.
+    #[test]
+    fn a_file_only_the_last_compile_read_is_no_return() {
+        let (_temp, checkout, unit) = fixture_with_sources();
+        teach(&unit, 100);
+        check_out(&checkout, &[("src/data.txt", Some("added"))]);
+        seed_from(&unit, &["src/lib.rs", "src/a.rs", "src/data.txt"], 101);
+
+        check_out(&checkout, &[("src/a.rs", Some("edited"))]);
+        let lease = unit.try_active_at(103).expect("an edit runs active");
+        assert!(lease.finish_at(CompileOutcome::Success, 104));
+        check_out(&checkout, &[("src/a.rs", Some("cached"))]);
+        let lease = unit
+            .try_active_at(105)
+            .expect("the added file still exists");
+        assert!(lease.finish_at(CompileOutcome::Success, 106));
+    }
+
+    #[test]
+    fn files_beyond_the_cached_build_are_compared_by_real_path() {
+        let (_temp, checkout, unit) = fixture_with_sources();
+        teach(&unit, 100);
+        let absolute = |path: &str| checkout.join(path).display().to_string();
+        compiled(&unit, &[&absolute("src/a.rs"), &absolute("src/lib.rs")]);
+        assert!(!unit.reads_beyond_cached_sources());
+
+        compiled(&unit, &["src/lib.rs", "src/a.rs", "src/data.txt"]);
+        assert!(!unit.reads_beyond_cached_sources(), "a missing file");
+        check_out(&checkout, &[("src/data.txt", Some("added"))]);
+        assert!(unit.reads_beyond_cached_sources());
+
+        #[cfg(unix)]
+        {
+            compiled(&unit, &["src/lib.rs", "src/lib.rs/below"]);
+            assert!(unit.reads_beyond_cached_sources(), "an unreadable file");
+        }
+        fs::remove_file(unit.cached_dep_info()).unwrap();
+        assert!(!unit.reads_beyond_cached_sources(), "no copy to compare");
+    }
+
+    /// A build through the cache leaves an identical copy alone, replaces a
+    /// stale one, and drops it when the unit has no dep-info.
+    #[test]
+    fn observing_a_build_refreshes_the_cached_dep_info() {
+        let (_temp, _checkout, unit) = fixture_with_sources();
+        teach(&unit, 100);
+        let copy = unit.cached_dep_info();
+        #[cfg(unix)]
+        let inode = |path: &Path| std::os::unix::fs::MetadataExt::ino(&fs::metadata(path).unwrap());
+        #[cfg(unix)]
+        let first = inode(&copy);
+        teach(&unit, 101);
+        #[cfg(unix)]
+        assert_eq!(inode(&copy), first, "an identical copy is not rewritten");
+
+        compiled(&unit, &["src/lib.rs"]);
+        teach(&unit, 102);
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "out.d: src/lib.rs\n");
+        assert_eq!(
+            read_state(&unit).cached_sources,
+            unit.source_set_digest(&copy)
+        );
+
+        fs::remove_file(unit.dep_info.as_ref().unwrap()).unwrap();
+        teach(&unit, 103);
+        assert!(!path_exists(&copy));
+        assert_eq!(read_state(&unit).cached_sources, None);
+    }
+
+    /// An idle learning unit has no graph, yet its state and cached dep-info
+    /// expire; with a graph, all three count.
+    #[test]
+    fn stale_learning_state_and_its_cached_dep_info_are_reclaimed() {
+        let (temp, checkout, unit) = fixture_with_sources();
+        let cache = temp.path().join("cache");
+        let target = checkout.join("target");
+        let window = std::time::Duration::from_secs(10);
+        let at = UNIX_EPOCH + std::time::Duration::from_secs(110);
+        let idle = || {
+            filetime::set_file_mtime(&unit.unit_dir, filetime::FileTime::from_unix_time(100, 0))
+                .unwrap()
+        };
+        teach(&unit, 100);
+        let size = |path: &Path| fs::metadata(path).unwrap().len();
+        let learning = size(&unit.state_path) + size(&unit.cached_dep_info());
+
+        fs::create_dir(&unit.rustc_dir).unwrap();
+        fs::write(unit.rustc_dir.join("graph.bin"), b"payload").unwrap();
+        idle();
+        assert_eq!(preview_stale(&target, window, at).bytes, learning + 7);
+
+        fs::remove_dir_all(&unit.rustc_dir).unwrap();
+        idle();
+        let preview = preview_stale(&target, window, at);
+        assert_eq!((preview.units, preview.bytes), (1, learning));
+        assert_eq!(prune_stale(&cache, &target, window, at), preview);
+        assert!(!path_exists(&unit.state_path));
+        assert!(!path_exists(&unit.cached_dep_info()));
+        assert!(unit.lock_path.is_file());
+        assert_eq!(prune_stale(&cache, &target, window, at).units, 0);
     }
 
     #[test]

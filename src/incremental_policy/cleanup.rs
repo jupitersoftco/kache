@@ -116,7 +116,11 @@ fn sweep(
 }
 
 fn stale_bytes(unit: &AdaptiveUnit, window: Duration, at: SystemTime) -> Option<u64> {
-    if !real_directory(&unit.rustc_dir) {
+    // A learning unit has no graph, but its state and cached dep-info expire
+    // too; a unit with neither has nothing to reclaim.
+    let learning = definitely_missing(&unit.rustc_dir)
+        && (path_exists(&unit.state_path) || path_exists(&unit.cached_dep_info()));
+    if !real_directory(&unit.rustc_dir) && !learning {
         return None;
     }
     let last_used_secs = match unit.load_state() {
