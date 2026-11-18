@@ -3273,6 +3273,19 @@ mod tests {
         assert!(!path_exists(&unit.cached_dep_info()));
         assert!(unit.lock_path.is_file());
         assert_eq!(prune_stale(&cache, &target, window, at).units, 0);
+
+        // Either one alone expires too: an older Kache's state has no copy,
+        // and a copy can outlive its state.
+        teach(&unit, 100);
+        fs::remove_file(unit.cached_dep_info()).unwrap();
+        idle();
+        assert_eq!(prune_stale(&cache, &target, window, at).units, 1);
+        assert!(!path_exists(&unit.state_path));
+        teach(&unit, 100);
+        fs::remove_file(&unit.state_path).unwrap();
+        idle();
+        assert_eq!(prune_stale(&cache, &target, window, at).units, 1);
+        assert!(!path_exists(&unit.cached_dep_info()));
     }
 
     #[test]
