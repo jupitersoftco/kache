@@ -3075,6 +3075,146 @@ fn incremental_force_list_requires_incremental_and_managed_layout() {
     assert!(!lease.finish(CompileOutcome::Abnormal));
 }
 
+/// Eligible incremental args for a unit in the Cargo profile directory
+/// `target/<profile>` under `temp`: legacy `deps`, or the unit's own `out` in
+/// Cargo's per-unit layout.
+fn eligible_incremental_args_in(
+    temp: &tempfile::TempDir,
+    crate_name: &str,
+    profile: &str,
+    per_unit: bool,
+) -> RustcArgs {
+    let profile = temp.path().join("target").join(profile);
+    let out_dir = if per_unit {
+        profile.join("build/tap-lib/0123456789abcdef/out")
+    } else {
+        profile.join("deps")
+    };
+    let incremental = profile.join("incremental");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    std::fs::create_dir_all(&incremental).unwrap();
+    RustcCompiler::new()
+        .parse(&[
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            crate_name.to_string(),
+            temp.path()
+                .join("src/lib.rs")
+                .to_string_lossy()
+                .into_owned(),
+            "--out-dir".to_string(),
+            out_dir.to_string_lossy().into_owned(),
+            "-C".to_string(),
+            format!("incremental={}", incremental.display()),
+            "-Cextra-filename=-1234abcd".to_string(),
+        ])
+        .unwrap()
+}
+
+#[test]
+fn adaptive_profile_scope_admits_only_listed_profiles_in_every_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = test_config(temp.path().join("cache"));
+    config.adaptive_incremental = true;
+    config.adaptive_incremental_profiles = Some(vec!["iteration".to_string()]);
+    for (profile, per_unit) in [
+        ("iteration", false),
+        ("x86_64-apple-darwin/iteration", false),
+        ("iteration", true),
+        ("aarch64-unknown-linux-gnu/iteration", true),
+    ] {
+        let args = eligible_incremental_args_in(&temp, "tap_lib", profile, per_unit);
+        assert!(adaptive_profile_in_scope(&config, &args), "{profile}");
+        assert!(
+            managed_incremental_unit(&config, &args, || false).is_some(),
+            "{profile} per_unit={per_unit} is in scope"
+        );
+        assert!(
+            managed_incremental_unit(&config, &args, || true).is_none(),
+            "hidden inputs still decline an in-scope unit"
+        );
+    }
+    for (profile, per_unit) in [
+        ("debug", false),
+        ("debug", true),
+        ("desktop-dev", false),
+        ("release", false),
+        ("iteration/debug", false),
+    ] {
+        let args = eligible_incremental_args_in(&temp, "tap_lib", profile, per_unit);
+        assert!(!adaptive_profile_in_scope(&config, &args), "{profile}");
+        assert!(
+            managed_incremental_unit(&config, &args, || {
+                panic!("hidden-input discovery must not run for an out-of-scope unit")
+            })
+            .is_none(),
+            "{profile} per_unit={per_unit} is out of scope"
+        );
+    }
+
+    // No list keeps upstream's behaviour: every profile is in scope.
+    config.adaptive_incremental_profiles = None;
+    for profile in ["debug", "desktop-dev", "iteration"] {
+        let args = eligible_incremental_args_in(&temp, "tap_lib", profile, false);
+        assert!(
+            managed_incremental_unit(&config, &args, || false).is_some(),
+            "{profile}"
+        );
+    }
+    // An empty list admits nothing.
+    config.adaptive_incremental_profiles = Some(Vec::new());
+    let args = eligible_incremental_args_in(&temp, "tap_lib", "iteration", false);
+    assert!(managed_incremental_unit(&config, &args, || false).is_none());
+}
+
+#[test]
+fn incremental_force_list_is_not_limited_by_the_adaptive_profile_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = test_config(temp.path().join("cache"));
+    config.adaptive_incremental_profiles = Some(vec!["iteration".to_string()]);
+    config.incremental_crates = vec!["tap_lib".to_string()];
+    let args = eligible_incremental_args_in(&temp, "tap_lib", "debug", false);
+    for adaptive in [false, true] {
+        config.adaptive_incremental = adaptive;
+        let unit = managed_incremental_unit(&config, &args, || false)
+            .expect("a force-listed crate keeps its incremental lane in any profile");
+        let lease = unit.try_immediate().unwrap();
+        assert!(!lease.finish(CompileOutcome::Abnormal));
+    }
+    // The same crate unlisted, with adaptive on, is out of scope.
+    config.incremental_crates.clear();
+    assert!(managed_incremental_unit(&config, &args, || false).is_none());
+}
+
+#[test]
+fn an_out_of_scope_unit_drops_private_state_it_learned_before_the_scope() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = test_config(temp.path().join("cache"));
+    config.adaptive_incremental = true;
+    let args = eligible_incremental_args_in(&temp, "tap_lib", "debug", false);
+
+    // Learned while every profile was in scope.
+    let unit = managed_incremental_unit(&config, &args, || false).unwrap();
+    let lease = unit.try_immediate().unwrap();
+    let private = lease
+        .compiler_args(&args)
+        .iter()
+        .find_map(|arg| arg.strip_prefix("incremental=").map(PathBuf::from))
+        .unwrap();
+    std::fs::create_dir_all(&private).unwrap();
+    std::fs::write(private.join("graph"), "learned").unwrap();
+    drop(lease);
+
+    config.adaptive_incremental_profiles = Some(vec!["iteration".to_string()]);
+    assert!(managed_incremental_unit(&config, &args, || false).is_none());
+    assert!(
+        !private.exists(),
+        "an out-of-scope unit must not keep private incremental state"
+    );
+    assert!(!unit.has_policy_state());
+}
+
 #[test]
 fn force_list_never_retries_through_adaptive_seed_policy() {
     let mut config = test_config(PathBuf::from("cache"));

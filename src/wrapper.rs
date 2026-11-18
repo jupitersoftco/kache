@@ -201,10 +201,24 @@ fn managed_unit_keys_first(managed: bool, force_listed: bool, policy_state: bool
     managed && (force_listed || policy_state)
 }
 
+/// Whether the Cargo profile of an eligible unit is one adaptive incremental
+/// may manage (`[cache] adaptive_incremental_profiles`). The profile is the
+/// name of the directory holding `deps` or the unit's own `out`, so
+/// `target/iteration` and `target/<triple>/iteration` are both `iteration`.
+/// Eligibility already found that directory.
+fn adaptive_profile_in_scope(config: &Config, args: &RustcArgs) -> bool {
+    args.out_dir
+        .as_deref()
+        .and_then(crate::cargo_layout::deps_profile)
+        .and_then(Path::file_name)
+        .is_some_and(|profile| config.adaptive_incremental_profile_in_scope(profile))
+}
+
 /// Build the one safety-checked unit used by both adaptive and force-list
 /// incremental compiles. Declared inputs are checked only after the narrow
-/// Cargo layout is known to be eligible; rejecting them also clears any old
-/// private state for that unit.
+/// Cargo layout is known to be eligible; rejecting them, or a profile outside
+/// the adaptive scope, also clears any old private state for that unit. A
+/// force-listed crate is not limited by the profile scope.
 fn managed_incremental_unit<F>(
     config: &Config,
     args: &RustcArgs,
@@ -218,6 +232,10 @@ where
     }
     let guard = adaptive_policy_guard(config);
     let unit = AdaptiveUnit::eligible(args, &guard)?;
+    if !force_incremental_requested(config, args) && !adaptive_profile_in_scope(config, args) {
+        let _ = unit.reset();
+        return None;
+    }
     if extra_inputs_declared() {
         let _ = unit.reset();
         return None;

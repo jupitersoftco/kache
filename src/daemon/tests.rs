@@ -1632,6 +1632,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         clean_incremental: false,
         preserve_incremental: false,
         adaptive_incremental: true,
+        adaptive_incremental_profiles: None,
         seed_incremental: true,
         incremental_seed_from: None,
         unstable: Default::default(),
