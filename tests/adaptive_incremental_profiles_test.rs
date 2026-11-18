@@ -24,10 +24,11 @@ fn kache_binary() -> &'static str {
 /// One project, one store and one target, built under a chosen profile and
 /// configuration.
 struct Fixture {
+    // Fields drop in declaration order: the daemon stops while its runtime
+    // directory (`cache`) still exists.
+    _daemon: common::DaemonGuard,
     project: tempfile::TempDir,
     cache: tempfile::TempDir,
-    // Declared after the directories it stops a daemon for.
-    _daemon: common::DaemonGuard,
     mtime: i64,
 }
 
@@ -61,9 +62,9 @@ impl Fixture {
             .as_secs() as i64
             - 3_600;
         Self {
+            _daemon: daemon,
             project,
             cache,
-            _daemon: daemon,
             mtime,
         }
     }
@@ -109,6 +110,10 @@ impl Fixture {
             .current_dir(self.project.path())
             .env("RUSTC_WRAPPER", kache_binary())
             .env("CARGO_TARGET_DIR", self.target())
+            // The fingerprint and policy paths below assume the host layout
+            // `target/<profile>` with no separate build directory.
+            .env_remove("CARGO_BUILD_TARGET")
+            .env_remove("CARGO_BUILD_BUILD_DIR")
             .env("CARGO_INCREMENTAL", "1")
             .env("KACHE_SCHEDULER", "1")
             .env("KACHE_LOG", "kache=debug")

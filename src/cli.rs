@@ -7400,7 +7400,24 @@ fn adaptive_incremental_detail(enabled: bool, profiles: Option<&[String]>) -> St
     let scope = match profiles {
         None => "every profile".to_string(),
         Some([]) => "no profile".to_string(),
-        Some(names) => format!("profiles {}", names.join(", ")),
+        Some(names) => {
+            // A TOML name may hold a newline; keep the row one line.
+            let names: Vec<String> = names
+                .iter()
+                .map(|name| {
+                    name.chars()
+                        .map(|c| {
+                            if c.is_control() {
+                                c.escape_default().collect()
+                            } else {
+                                c.to_string()
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            format!("profiles {}", names.join(", "))
+        }
     };
     if enabled {
         format!("on, {scope}")

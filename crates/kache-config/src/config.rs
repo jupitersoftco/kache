@@ -1755,19 +1755,35 @@ fn env_or_ignored_for(
 /// can neither shift a cache key nor enable anything, and a build that locks
 /// adaptive off for one process (a push gate, a run meant to store) must get
 /// the keyed path whatever the file says.
+///
+/// The two adaptive variables count only when the loader reads them: a value
+/// that is not Unicode, or is blank, is treated as unset and leaves the file
+/// in force, so `export KACHE_ADAPTIVE_INCREMENTAL=` clears an override
+/// instead of turning adaptive on (or, for the profile list, scoping it to no
+/// profile).
 fn env_override_applies(name: &str, value: &std::ffi::OsStr, ignore_env: bool) -> bool {
-    !ignore_env
-        || (name == "KACHE_ADAPTIVE_INCREMENTAL" && value.to_str().is_some_and(env_flag_off))
+    let set = || value.to_str().filter(|value| !value.trim().is_empty());
+    match name {
+        "KACHE_ADAPTIVE_INCREMENTAL" => {
+            set().is_some_and(|value| !ignore_env || env_flag_off(value))
+        }
+        "KACHE_ADAPTIVE_INCREMENTAL_PROFILES" => !ignore_env && set().is_some(),
+        _ => !ignore_env,
+    }
 }
 
-/// The permissive off spelling: `0` or case-insensitive `false`.
+/// The off spellings of `KACHE_ADAPTIVE_INCREMENTAL`, trimmed and
+/// case-insensitive: `0`, `false`, `off` or `no`.
 fn env_flag_off(value: &str) -> bool {
-    value == "0" || value.eq_ignore_ascii_case("false")
+    ["0", "false", "off", "no"]
+        .iter()
+        .any(|off| value.trim().eq_ignore_ascii_case(off))
 }
 
 /// Adaptive incremental from this invocation's variable, else the file, else
-/// on. Any value other than `0` or `false` turns it on; see
-/// [`env_override_applies`] for what `ignore_env` leaves in effect.
+/// on. A set value other than an off spelling ([`env_flag_off`]) turns it
+/// on; see [`env_override_applies`] for what counts as set and what
+/// `ignore_env` leaves in effect.
 fn adaptive_incremental_setting(env: Option<&str>, ignore_env: bool, file: Option<bool>) -> bool {
     match env.filter(|value| {
         env_override_applies("KACHE_ADAPTIVE_INCREMENTAL", value.as_ref(), ignore_env)
@@ -2037,23 +2053,27 @@ impl Config {
                 .and_then(|c| c.adaptive_incremental),
         );
 
-        let adaptive_incremental_profiles = env_or_ignored_for(
-            invocation,
-            "KACHE_ADAPTIVE_INCREMENTAL_PROFILES",
-            ignore_env,
-        )
-        .map(|v| adaptive_profile_names(v.split(',')))
-        .ok()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .ok()?
-                .cache
-                .as_ref()?
-                .adaptive_incremental_profiles
-                .as_ref()
-                .map(|names| adaptive_profile_names(names.iter().map(String::as_str)))
-        });
+        let adaptive_incremental_profiles = invocation
+            .var("KACHE_ADAPTIVE_INCREMENTAL_PROFILES")
+            .ok()
+            .filter(|value| {
+                env_override_applies(
+                    "KACHE_ADAPTIVE_INCREMENTAL_PROFILES",
+                    value.as_ref(),
+                    ignore_env,
+                )
+            })
+            .map(|value| adaptive_profile_names(value.split(',')))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()?
+                    .cache
+                    .as_ref()?
+                    .adaptive_incremental_profiles
+                    .as_ref()
+                    .map(|names| adaptive_profile_names(names.iter().map(String::as_str)))
+            });
 
         let seed_incremental = env_or_ignored_for(invocation, "KACHE_SEED_INCREMENTAL", ignore_env)
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))

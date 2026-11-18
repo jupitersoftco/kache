@@ -11942,4 +11942,10 @@ fn doctor_shows_the_adaptive_switch_and_its_profile_scope() {
         adaptive_incremental_detail(false, None),
         "off (when on: every profile)"
     );
+    // A control character in a configured name is escaped, so the row
+    // stays one line; other characters print as written.
+    assert_eq!(
+        adaptive_incremental_detail(true, Some(&names(&["iter\nation", "dé\tv"]))),
+        "on, profiles iter\\nation, dé\\tv"
+    );
 }

@@ -250,12 +250,16 @@ fn ignored_override_warnings_use_only_client_keys_and_never_their_values() {
     let adaptive_off = invocation(vec![("KACHE_ADAPTIVE_INCREMENTAL", "0")]);
     let adaptive_on = invocation(vec![("KACHE_ADAPTIVE_INCREMENTAL", "1")]);
     let warnings = Warnings(Arc::new(Mutex::new(Vec::new())));
+    let count = || warnings.0.lock().unwrap().len();
     tracing::subscriber::with_default(warnings.clone(), || {
         warn_ignored_env_overrides_for(&empty);
         warn_ignored_env_overrides_for(&left);
         warn_ignored_env_overrides_for(&right);
+        assert_eq!(count(), 2);
         warn_ignored_env_overrides_for(&adaptive_off);
+        assert_eq!(count(), 2, "the applied opt-out is not reported as ignored");
         warn_ignored_env_overrides_for(&adaptive_on);
+        assert_eq!(count(), 3, "turning adaptive on is ignored and reported");
     });
     let messages = warnings.0.lock().unwrap();
     assert_eq!(messages.len(), 3, "{messages:?}");
@@ -3704,6 +3708,52 @@ fn test_adaptive_incremental_default_file_env_precedence() {
             None
         );
     }
+    // Without `ignore_env`, a blank or non-Unicode value is one the loader
+    // does not read, so the editor keeps the field editable and doctor
+    // names the file.
+    std::fs::write(&cfg_path, "[cache]\nadaptive_incremental = false\n").unwrap();
+    let key = ["cache".to_string(), "adaptive_incremental".to_string()];
+    let profiles_key = [
+        "cache".to_string(),
+        "adaptive_incremental_profiles".to_string(),
+    ];
+    {
+        let _adaptive = NamedEnvGuard::set("KACHE_ADAPTIVE_INCREMENTAL", "");
+        let _profiles = NamedEnvGuard::set("KACHE_ADAPTIVE_INCREMENTAL_PROFILES", " ");
+        assert!(!Config::load().unwrap().adaptive_incremental);
+        assert!(!EnvOverrides::detect().adaptive_incremental);
+        assert_eq!(env_override_for(&key, false), None);
+        assert_eq!(env_override_for(&profiles_key, false), None);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"1\xff");
+        let _adaptive = NamedEnvGuard::remove("KACHE_ADAPTIVE_INCREMENTAL");
+        let _profiles = NamedEnvGuard::remove("KACHE_ADAPTIVE_INCREMENTAL_PROFILES");
+        unsafe {
+            std::env::set_var("KACHE_ADAPTIVE_INCREMENTAL", raw);
+            std::env::set_var("KACHE_ADAPTIVE_INCREMENTAL_PROFILES", raw);
+        }
+        assert!(!Config::load().unwrap().adaptive_incremental);
+        assert!(!EnvOverrides::detect().adaptive_incremental);
+        assert_eq!(env_override_for(&key, false), None);
+        assert_eq!(env_override_for(&profiles_key, false), None);
+    }
+    {
+        let _adaptive = NamedEnvGuard::set("KACHE_ADAPTIVE_INCREMENTAL", "1");
+        let _profiles = NamedEnvGuard::set("KACHE_ADAPTIVE_INCREMENTAL_PROFILES", "iteration");
+        assert!(Config::load().unwrap().adaptive_incremental);
+        assert!(EnvOverrides::detect().adaptive_incremental);
+        assert_eq!(
+            env_override_for(&key, false),
+            Some("KACHE_ADAPTIVE_INCREMENTAL")
+        );
+        assert_eq!(
+            env_override_for(&profiles_key, false),
+            Some("KACHE_ADAPTIVE_INCREMENTAL_PROFILES")
+        );
+    }
     assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_ADAPTIVE_INCREMENTAL"));
 }
 
@@ -7016,7 +7066,7 @@ fn adaptive_incremental_env_opt_out_wins_over_every_file_shape() {
             load_invocation_config(root.path(), path, *host_path, &[]).adaptive_incremental,
             "{name}: the shape must turn adaptive on without the variable"
         );
-        for off in ["0", "false", "FALSE"] {
+        for off in ["0", "false", "FALSE", "off", "no"] {
             assert!(
                 !load_invocation_config(
                     root.path(),
@@ -7075,13 +7125,23 @@ fn adaptive_incremental_profiles_parse_from_the_file_and_the_variable() {
         ),
         names(&["debug"])
     );
-    assert_eq!(
-        load(
-            "[cache]\nadaptive_incremental_profiles = [\"iteration\"]\n",
-            &[(var, "")]
-        ),
-        names(&[])
-    );
+    // A blank variable is unset: the file's list stays in force.
+    for blank in ["", " ", " , "] {
+        let expected = if blank.contains(',') {
+            names(&[])
+        } else {
+            names(&["iteration"])
+        };
+        assert_eq!(
+            load(
+                "[cache]\nadaptive_incremental_profiles = [\"iteration\"]\n",
+                &[(var, blank)]
+            ),
+            expected,
+            "{blank:?}"
+        );
+    }
+    assert_eq!(load("[cache]\n", &[(var, "")]), None);
     assert_eq!(
         load(
             "[cache]\nignore_env = true\nadaptive_incremental_profiles = [\"iteration\"]\n",
@@ -7143,18 +7203,38 @@ fn only_the_adaptive_opt_out_survives_ignore_env() {
             "without ignore_env {name}={value} applies"
         );
     }
-    for off in ["0", "false", "False"] {
+    for off in ["0", "false", "False", "off", "OFF", "no", " 0 "] {
         assert!(
             env_override_applies(adaptive, OsStr::new(off), true),
             "{off}"
         );
     }
-    for on in ["1", "true", "", "off", "no"] {
+    for on in ["1", "true", "", "  ", "yes", "00", "falsey"] {
         assert!(
             !env_override_applies(adaptive, OsStr::new(on), true),
             "{on:?}"
         );
     }
+    // A blank adaptive variable is unset, with or without `ignore_env`;
+    // other variables keep counting a blank value.
+    for name in [adaptive, "KACHE_ADAPTIVE_INCREMENTAL_PROFILES"] {
+        for blank in ["", " "] {
+            assert!(
+                !env_override_applies(name, OsStr::new(blank), false),
+                "{name}={blank:?}"
+            );
+        }
+    }
+    assert!(env_override_applies(
+        "KACHE_ADAPTIVE_INCREMENTAL_PROFILES",
+        OsStr::new(","),
+        false
+    ));
+    assert!(env_override_applies(
+        "KACHE_SEED_INCREMENTAL",
+        OsStr::new(""),
+        false
+    ));
     for other in [
         "KACHE_SEED_INCREMENTAL",
         "KACHE_ADAPTIVE_INCREMENTAL_PROFILES",
@@ -7167,11 +7247,19 @@ fn only_the_adaptive_opt_out_survives_ignore_env() {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        assert!(!env_override_applies(
-            adaptive,
-            OsStr::from_bytes(b"0\xff"),
-            true
-        ));
+        // The loader reads neither adaptive variable when it is not
+        // Unicode, so neither overrides the file; other variables (a
+        // non-Unicode store path) still do.
+        let raw = OsStr::from_bytes(b"0\xff");
+        for ignore_env in [false, true] {
+            assert!(!env_override_applies(adaptive, raw, ignore_env));
+            assert!(!env_override_applies(
+                "KACHE_ADAPTIVE_INCREMENTAL_PROFILES",
+                raw,
+                ignore_env
+            ));
+        }
+        assert!(env_override_applies("KACHE_CACHE_DIR", raw, false));
     }
 
     for (env, ignore_env, file, expected) in [
@@ -7185,6 +7273,11 @@ fn only_the_adaptive_opt_out_survives_ignore_env() {
         (Some("1"), true, None, true),
         (Some("0"), true, Some(true), false),
         (Some("FALSE"), true, None, false),
+        (Some("off"), false, Some(true), false),
+        (Some("no"), true, Some(true), false),
+        (Some(""), false, Some(false), false),
+        (Some(" "), true, Some(false), false),
+        (Some(""), false, None, true),
     ] {
         assert_eq!(
             adaptive_incremental_setting(env, ignore_env, file),
