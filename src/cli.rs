@@ -7392,6 +7392,40 @@ fn doctor_config_file_check(
     }
 }
 
+/// Doctor's "Adaptive incremental" detail: the switch, and the Cargo profiles
+/// it may manage (`[cache] adaptive_incremental_profiles`; none set means
+/// every profile). The scope is shown while the switch is off too, so a
+/// staged scope can be checked before it takes effect.
+fn adaptive_incremental_detail(enabled: bool, profiles: Option<&[String]>) -> String {
+    let scope = match profiles {
+        None => "every profile".to_string(),
+        Some([]) => "no profile".to_string(),
+        Some(names) => {
+            // A TOML name may hold a newline; keep the row one line.
+            let names: Vec<String> = names
+                .iter()
+                .map(|name| {
+                    name.chars()
+                        .map(|c| {
+                            if c.is_control() {
+                                c.escape_default().collect()
+                            } else {
+                                c.to_string()
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            format!("profiles {}", names.join(", "))
+        }
+    };
+    if enabled {
+        format!("on, {scope}")
+    } else {
+        format!("off (when on: {scope})")
+    }
+}
+
 /// Labels of the daemon-related checks that become informational when the
 /// daemon is optional. Kept in sync with the check constructions in
 /// [`doctor`]; module-level so the disposition logic below is unit-testable.
@@ -8117,6 +8151,19 @@ pub fn doctor(
         detail: host_detail,
         fix: host_fix,
     });
+
+    // 3c. Adaptive incremental, as this process resolves it.
+    if let Some(ref cfg) = config {
+        checks.push(Check {
+            label: "Adaptive incremental",
+            pass: true,
+            detail: adaptive_incremental_detail(
+                cfg.adaptive_incremental,
+                cfg.adaptive_incremental_profiles.as_deref(),
+            ),
+            fix: None,
+        });
+    }
 
     // 4. Cache directory
     if let Some(ref cfg) = config {

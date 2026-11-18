@@ -2287,6 +2287,7 @@ mod tests {
                 clean_incremental: Some(false),
                 preserve_incremental: Some(true),
                 adaptive_incremental: Some(false),
+                adaptive_incremental_profiles: Some(vec!["iteration".to_string()]),
                 seed_incremental: None,
                 incremental_seed_from: None,
                 unstable: Default::default(),
@@ -2388,6 +2389,18 @@ mod tests {
         assert_eq!(cache.clean_incremental, Some(false));
         assert_eq!(cache.preserve_incremental, Some(true));
         assert_eq!(cache.adaptive_incremental, Some(false));
+        // No form field: a save keeps the profile scope, and an empty list
+        // (no profile) stays distinct from none (every profile).
+        assert_eq!(
+            cache.adaptive_incremental_profiles.as_deref(),
+            Some(&["iteration".to_string()][..])
+        );
+        for scope in [Some(Vec::new()), None] {
+            let mut scoped = original.clone();
+            scoped.cache.as_mut().unwrap().adaptive_incremental_profiles = scope.clone();
+            let saved = fields_to_file_config(&build_fields(&scoped, &empty_env()), &scoped);
+            assert_eq!(saved.cache.unwrap().adaptive_incremental_profiles, scope);
+        }
         assert_eq!(cache.event_log_max_size.as_deref(), Some("10MiB"));
         assert_eq!(cache.event_log_keep_lines, Some(500));
 

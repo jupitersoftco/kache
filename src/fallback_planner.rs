@@ -568,6 +568,7 @@ mod tests {
             clean_incremental: true,
             preserve_incremental: false,
             adaptive_incremental: true,
+            adaptive_incremental_profiles: None,
             seed_incremental: true,
             incremental_seed_from: None,
             unstable: Default::default(),
