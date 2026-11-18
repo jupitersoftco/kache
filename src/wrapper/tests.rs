@@ -14658,3 +14658,25 @@ fn preparation_records_whether_a_fresh_unit_looked_for_a_donor() {
         );
     }
 }
+
+#[test]
+fn the_active_dependency_check_names_why_it_kept_the_private_compile() {
+    use crate::args::ExternDep;
+    let artifact = ExternDep {
+        name: "dep".into(),
+        path: Some("/t/deps/libdep.rlib".into()),
+    };
+    let sysroot = ExternDep {
+        name: "std".into(),
+        path: None,
+    };
+    let both = [sysroot.clone(), artifact];
+    assert_eq!(externs_check_outcome(false, false, &both), "no store");
+    assert_eq!(externs_check_outcome(true, true, &both), "hashed");
+    assert_eq!(externs_check_outcome(true, false, &both), "over budget");
+    assert_eq!(
+        externs_check_outcome(true, false, &[sysroot]),
+        "no artifacts"
+    );
+    assert_eq!(externs_check_outcome(true, false, &[]), "no artifacts");
+}

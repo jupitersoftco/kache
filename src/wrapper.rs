@@ -8816,24 +8816,48 @@ fn current_externs_field(
 ) -> Option<String> {
     let start = std::time::Instant::now();
     let route = volume_route_path_rustc(args);
-    let (store, _) = opened
-        .insert(open_primary_and_fallback_for(
-            config,
-            &route,
-            args.invocation_env(),
-        ))
-        .as_ref()
-        .ok()?;
-    let hasher = store.file_hasher_for(args.invocation_env());
-    let field = crate::cache_key::externs_key_field(&args.externs, &hasher, budget);
+    let opened = opened.insert(open_primary_and_fallback_for(
+        config,
+        &route,
+        args.invocation_env(),
+    ));
+    let (field, bytes_hashed) = match opened.as_ref() {
+        Ok((store, _)) => {
+            let hasher = store.file_hasher_for(args.invocation_env());
+            let field = crate::cache_key::externs_key_field(&args.externs, &hasher, budget);
+            (field, hasher.stats().bytes_hashed)
+        }
+        Err(_) => (None, 0),
+    };
     tracing::debug!(
         crate_name = args.crate_name.as_deref().unwrap_or("unknown"),
+        outcome = externs_check_outcome(opened.is_ok(), field.is_some(), &args.externs),
         field = field.as_deref().unwrap_or("none"),
-        bytes_hashed = hasher.stats().bytes_hashed,
+        bytes_hashed,
         elapsed_ms = start.elapsed().as_millis() as u64,
         "adaptive active: dependency artifacts hashed"
     );
     field
+}
+
+/// How an active unit's dependency check ended, for its debug line. Every
+/// outcome but `hashed` keeps the unit on its private compile without
+/// looking up the cache; `over budget` names the case where a large or
+/// freshly rebuilt dependency set exceeded the hash budget.
+fn externs_check_outcome(
+    store_opened: bool,
+    hashed: bool,
+    externs: &[crate::args::ExternDep],
+) -> &'static str {
+    if !store_opened {
+        "no store"
+    } else if hashed {
+        "hashed"
+    } else if externs.iter().any(|ext| ext.path.is_some()) {
+        "over budget"
+    } else {
+        "no artifacts"
+    }
 }
 
 /// A hit restored a unit's outputs without its incremental state. Count it as
