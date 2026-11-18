@@ -2,9 +2,10 @@
 //!
 //! An unchanged checkout checks the artifact cache. After a build of a Cargo unit (a
 //! hit or a miss) and a later miss in the same target where only
-//! source/extern key groups changed (with any env or build-script groups that
-//! follow an edit), however far apart, the miss may seed a
-//! private incremental directory. Successful seeds enable a small, time-bounded run
+//! source/extern key groups changed, however far apart, the miss may seed a
+//! private incremental directory. A source edit may also move the env vars the
+//! unit reads and its build script's declared inputs, which a build script that
+//! stamps its sources does. Successful seeds enable a small, time-bounded run
 //! of early passthroughs before Kache probes the cache again. A run ends early
 //! when the unit's sources move back to the last state that went through the
 //! cache, as after a revert or a branch switch. An explicit crate force-list can request the same managed
@@ -199,6 +200,10 @@ pub(crate) struct KeyFingerprint {
     cache_key: String,
     stable: String,
     sources_externs: String,
+    /// The `sources` group alone.
+    sources: String,
+    /// The stable groups but [`SOURCE_DERIVED_GROUPS`].
+    underived: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -211,6 +216,13 @@ struct Observation {
     /// A cheap edit signal for a private compile, never an artifact key.
     #[serde(default)]
     primary_source: Option<String>,
+    /// [`KeyFingerprint::sources`]. An observation an older Kache wrote has
+    /// none, so its source-derived groups must match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sources: Option<String>,
+    /// [`KeyFingerprint::underived`], absent like `sources`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    underived: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -244,7 +256,9 @@ struct DiskState {
 
 enum LoadedState {
     Missing,
-    Valid(DiskState),
+    // Boxed: a state with its observation passes clippy's large_enum_variant
+    // limit, and each lease loads one.
+    Valid(Box<DiskState>),
     /// The file is present and readable but its contents are wrong: not a
     /// regular file, oversized, unparsable, or failing validation. Callers
     /// reset the unit — the state is evidence of corruption and relearning is
@@ -338,7 +352,7 @@ impl AdaptiveUnit {
         let lock = self.lock()?;
         let previous = match self.load_state() {
             LoadedState::Valid(state) if !state.in_flight && state.phase == Phase::Learning => {
-                state
+                *state
             }
             _ => return None,
         };
@@ -482,7 +496,7 @@ impl AdaptiveUnit {
         }
         let lock = self.lock()?;
         let previous = match self.load_state() {
-            LoadedState::Valid(state) if !state.in_flight => state,
+            LoadedState::Valid(state) if !state.in_flight => *state,
             LoadedState::Missing | LoadedState::Unavailable => return None,
             LoadedState::Valid(_) | LoadedState::Corrupt => {
                 reset_locked(self);
@@ -566,7 +580,7 @@ impl AdaptiveUnit {
         }
         let lock = self.lock()?;
         let state = match self.load_state() {
-            LoadedState::Valid(state) if !state.in_flight => state,
+            LoadedState::Valid(state) if !state.in_flight => *state,
             LoadedState::Missing | LoadedState::Unavailable => return None,
             LoadedState::Valid(_) | LoadedState::Corrupt => {
                 reset_locked(self);
@@ -614,7 +628,7 @@ impl AdaptiveUnit {
         let lock = self.lock()?;
         let restore = match self.load_state() {
             LoadedState::Missing => None,
-            LoadedState::Valid(state) if !state.in_flight => Some(state),
+            LoadedState::Valid(state) if !state.in_flight => Some(*state),
             // Decline rather than start fresh over a file that may be intact.
             LoadedState::Unavailable => return None,
             LoadedState::Valid(_) | LoadedState::Corrupt => {
@@ -663,7 +677,7 @@ impl AdaptiveUnit {
         let fingerprint = key_fingerprint(cache_key, fields)?;
         let lock = self.lock()?;
         let previous = match self.load_state() {
-            LoadedState::Valid(state) if !state.in_flight => state,
+            LoadedState::Valid(state) if !state.in_flight => *state,
             LoadedState::Missing | LoadedState::Unavailable => return None,
             LoadedState::Valid(_) | LoadedState::Corrupt => {
                 reset_locked(self);
@@ -821,7 +835,7 @@ impl AdaptiveUnit {
         if !valid_state(&state, &self.unit_key) {
             return LoadedState::Corrupt;
         }
-        LoadedState::Valid(state)
+        LoadedState::Valid(Box::new(state))
     }
 
     /// In-flight and reset markers are durable before any compiler or cleanup
@@ -1133,14 +1147,16 @@ impl KeyFingerprint {
             sources_externs: self.sources_externs.clone(),
             at_secs,
             primary_source: None,
+            sources: Some(self.sources.clone()),
+            underived: Some(self.underived.clone()),
         }
     }
 }
 
 /// Key groups a build script can derive from the unit's own sources: a
 /// script that reruns on every edit and stamps a digest of `src/` into
-/// `cargo:rustc-env` moves both on each edit. They belong to neither part, so
-/// they may move with an edit but never qualify a pair on their own.
+/// `cargo:rustc-env` moves both on each edit. They are stable groups that
+/// may differ in a qualifying pair whose `sources` group differs too.
 const SOURCE_DERIVED_GROUPS: [&str; 2] = ["env_deps", "build_script_inputs"];
 
 /// Split Kache's grouped key digests into stable and mutation-varying parts.
@@ -1157,39 +1173,60 @@ pub(crate) fn key_fingerprint(
     stable.update(b"kache-auto-stable-v1\0");
     let mut dynamic = blake3::Hasher::new();
     dynamic.update(b"kache-auto-sources-externs-v1\0");
-    let mut stable_count = 0usize;
+    let mut sources = blake3::Hasher::new();
+    sources.update(b"kache-auto-sources-v1\0");
+    let mut underived = blake3::Hasher::new();
+    underived.update(b"kache-auto-underived-v1\0");
+    let mut underived_count = 0usize;
     let mut dynamic_count = 0usize;
     for (name, value) in fields {
-        let target = if matches!(name.as_str(), "sources" | "externs") {
-            dynamic_count += 1;
-            &mut dynamic
-        } else if SOURCE_DERIVED_GROUPS.contains(&name.as_str()) {
-            continue;
-        } else {
-            stable_count += 1;
-            &mut stable
+        let group = |target: &mut blake3::Hasher| {
+            fold(target, name.as_bytes());
+            fold(target, value.as_bytes());
         };
-        fold(target, name.as_bytes());
-        fold(target, value.as_bytes());
+        match name.as_str() {
+            "sources" | "externs" => {
+                dynamic_count += 1;
+                group(&mut dynamic);
+                if name == "sources" {
+                    group(&mut sources);
+                }
+            }
+            derived if SOURCE_DERIVED_GROUPS.contains(&derived) => group(&mut stable),
+            _ => {
+                underived_count += 1;
+                group(&mut stable);
+                group(&mut underived);
+            }
+        }
     }
-    if stable_count == 0 || dynamic_count == 0 {
+    if underived_count == 0 || dynamic_count == 0 {
         return None;
     }
+    let hex = |hasher: blake3::Hasher| hasher.finalize().to_hex().to_string();
     Some(KeyFingerprint {
         cache_key: cache_key.to_owned(),
-        stable: stable.finalize().to_hex().to_string(),
-        sources_externs: dynamic.finalize().to_hex().to_string(),
+        stable: hex(stable),
+        sources_externs: hex(dynamic),
+        sources: hex(sources),
+        underived: hex(underived),
     })
 }
 
 /// Two misses of one unit whose sources or dependencies differ and whose
-/// stable groups do not: someone is editing it. Groups the edit itself can
-/// move ([`SOURCE_DERIVED_GROUPS`]) may differ too. The gap between them does
-/// not matter; a person takes minutes between edits.
+/// stable groups do not: someone is editing it. When its `sources` group
+/// differs, the groups the edit itself can move ([`SOURCE_DERIVED_GROUPS`])
+/// may differ too; a dependency or env change never moves `sources`. The
+/// gap between them does not matter; a person takes minutes between edits.
 fn qualifying_pair(previous: &Observation, current: &KeyFingerprint) -> bool {
     previous.cache_key != current.cache_key
-        && previous.stable == current.stable
         && previous.sources_externs != current.sources_externs
+        && (previous.stable == current.stable
+            || (previous
+                .sources
+                .as_ref()
+                .is_some_and(|sources| *sources != current.sources)
+                && previous.underived.as_ref() == Some(&current.underived)))
 }
 
 fn recent(then: u64, now: u64, window: u64) -> bool {
@@ -1212,10 +1249,14 @@ fn valid_state(state: &DiskState, unit_key: &str) -> bool {
         && (!valid_hex_digest(&observation.cache_key)
             || !valid_hex_digest(&observation.stable)
             || !valid_hex_digest(&observation.sources_externs)
-            || observation
-                .primary_source
-                .as_deref()
-                .is_some_and(|hash| !valid_hex_digest(hash)))
+            || [
+                &observation.primary_source,
+                &observation.sources,
+                &observation.underived,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|hash| !valid_hex_digest(hash)))
     {
         return false;
     }
@@ -3341,6 +3382,8 @@ mod tests {
             sources_externs: cache_key("dynamic"),
             at_secs: 100,
             primary_source: None,
+            sources: None,
+            underived: None,
         };
         let mut state = DiskState {
             schema: STATE_SCHEMA,
@@ -3681,6 +3724,8 @@ mod tests {
                 cache_key: cache_key("learning"),
                 stable: cache_key("stable"),
                 sources_externs: cache_key("dynamic"),
+                sources: cache_key("sources"),
+                underived: cache_key("underived"),
             }
             .at(10),
         );
@@ -3711,6 +3756,8 @@ mod tests {
                 cache_key: cache_key("active"),
                 stable: cache_key("stable"),
                 sources_externs: cache_key("dynamic"),
+                sources: cache_key("sources"),
+                underived: cache_key("underived"),
             }
             .at(10),
         );
@@ -3726,7 +3773,14 @@ mod tests {
         teach(&unit, 10);
         let state = read_state(&unit);
 
-        for field in ["cache", "stable", "dynamic", "primary_source"] {
+        for field in [
+            "cache",
+            "stable",
+            "dynamic",
+            "primary_source",
+            "sources",
+            "underived",
+        ] {
             let mut invalid = state.clone();
             let observation = invalid.observation.as_mut().unwrap();
             match field {
@@ -3734,6 +3788,8 @@ mod tests {
                 "stable" => observation.stable = "not-a-digest".into(),
                 "dynamic" => observation.sources_externs = "not-a-digest".into(),
                 "primary_source" => observation.primary_source = Some("not-a-digest".into()),
+                "sources" => observation.sources = Some("not-a-digest".into()),
+                "underived" => observation.underived = Some("not-a-digest".into()),
                 _ => unreachable!(),
             }
             assert!(!valid_state(&invalid, &unit.unit_key), "accepted {field}");
@@ -3935,6 +3991,9 @@ mod tests {
         grouped
     }
 
+    /// Only a source edit moves the source-derived groups. A dependency
+    /// rebuilt for the same env change, or one a build script's declared
+    /// input follows, does not qualify a dependent that reads it too.
     #[test]
     fn source_derived_groups_may_move_with_an_edit_but_never_alone() {
         let previous = key_fingerprint(&cache_key("first"), &stamped("source-a", "stamp-a"))
@@ -3948,9 +4007,11 @@ mod tests {
         };
         assert!(qualifies("edit", &stamped("source-b", "stamp-b")));
         assert!(qualifies("unstamped edit", &stamped("source-b", "stamp-a")));
-        let mut dependency = stamped("source-a", "stamp-b");
+        let mut dependency = stamped("source-a", "stamp-a");
         dependency.insert("externs".into(), "extern-b".into());
         assert!(qualifies("dependency", &dependency));
+        dependency.insert("env_deps".into(), "stamp-b".into());
+        assert!(!qualifies("dependency and env", &dependency));
 
         assert!(!qualifies("stamp only", &stamped("source-a", "stamp-b")));
         for group in SOURCE_DERIVED_GROUPS {
@@ -3974,6 +4035,25 @@ mod tests {
             .is_none(),
             "a source-derived group is no stable group"
         );
+    }
+
+    /// An observation an older Kache wrote lacks the separate digests: its
+    /// stable part still matches an edit that leaves the derived groups, and
+    /// a stamped edit learns again once.
+    #[test]
+    fn an_observation_without_separate_digests_needs_its_derived_groups() {
+        let mut previous = key_fingerprint(&cache_key("first"), &stamped("source-a", "stamp-a"))
+            .unwrap()
+            .at(100);
+        (previous.sources, previous.underived) = (None, None);
+        let qualifies = |label: &str, grouped: &BTreeMap<String, String>| {
+            qualifying_pair(
+                &previous,
+                &key_fingerprint(&cache_key(label), grouped).unwrap(),
+            )
+        };
+        assert!(qualifies("unstamped edit", &stamped("source-b", "stamp-a")));
+        assert!(!qualifies("edit", &stamped("source-b", "stamp-b")));
     }
 
     /// The repro of a crate whose build script stamps its source digest: the
