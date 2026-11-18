@@ -502,9 +502,12 @@ fn assert_unstored_after_a_save(event: &Value) {
     assert_eq!(event["skip_reason"], "inputs-changed", "event: {event:#}");
 }
 
-/// A learning library starts cold when its workspace guard changes. A changed
-/// environment prevents seed qualification, and a save during that compile
-/// must leave no stored artifact or reusable private state.
+/// A learning library starts cold when its workspace guard changes, and a
+/// save during that compile is not stored. It compiles before keying, so its
+/// key covers the save rustc read, and the edit qualifies the seed although
+/// the environment changed too: a source edit may move the env vars a unit
+/// reads. The revert returns to the cached sources, looks them up, misses on
+/// the changed environment and seeds again.
 #[cfg(unix)]
 #[test]
 fn a_save_while_a_library_with_policy_state_compiles_is_not_stored() {
@@ -530,10 +533,15 @@ fn a_save_while_a_library_with_policy_state_compiles_is_not_stored() {
     assert_passthrough(&lib_event, "adaptive seed");
     assert_eq!(lib_event["compiler_runs"], 1, "event: {lib_event:#}");
     assert_eq!(lib_event["dep_info_runs"], 0, "event: {lib_event:#}");
+    assert_eq!(lib_event["store_output_blobs"], 0, "event: {lib_event:#}");
 
     fs::write(fixture.project.join("lib/src/lib.rs"), lib(1)).unwrap();
     let (printed, lib_event) = build("b", None);
-    assert_eq!(lib_event["result"], "miss", "event: {lib_event:#}");
+    assert_passthrough(&lib_event, "adaptive seed");
+    assert_eq!(
+        lib_event["dep_info_runs"], 1,
+        "the revert keyed a lookup: {lib_event:#}"
+    );
     assert_eq!(printed, "1", "the revert compiled");
 }
 
