@@ -1185,6 +1185,58 @@ pub struct BundledArchive {
 /// instead. Distinct from any real hash, so it never reads as a content match.
 pub const EXTERN_UNREADABLE: &str = "(sysroot)";
 
+/// The `--extern`s a key folds, in the order it folds them: those that name
+/// an artifact, by crate name.
+fn keyed_externs(externs: &[crate::args::ExternDep]) -> Vec<(&str, &Path)> {
+    let mut keyed: Vec<_> = externs
+        .iter()
+        .filter_map(|ext| Some((ext.name.as_str(), ext.path.as_deref()?)))
+        .collect();
+    keyed.sort_by_key(|(name, _)| *name);
+    keyed
+}
+
+/// What one extern adds to the `externs` key group: its name and artifact
+/// hash, or a marker when the artifact cannot be hashed ([`EXTERN_UNREADABLE`]).
+fn fold_extern(update: &mut impl FnMut(&[u8]), name: &str, hash: Option<&str>) {
+    let parts: &[&[u8]] = match hash {
+        Some(hash) => &[b"extern:", name.as_bytes(), b"=", hash.as_bytes(), b"\n"],
+        None => &[b"extern_unreadable:", name.as_bytes(), b"\n"],
+    };
+    for part in parts {
+        update(part);
+    }
+}
+
+/// The `externs` field ([`KEY_FIELD_HEX`] hex digits) a key would record
+/// for `externs` with their artifacts as they are now. `None` when no extern
+/// names an artifact, as a key then records no such field, or when hashing
+/// them would read more than `budget` bytes the hash memo cannot supply.
+/// Adaptive incremental compares it with the field of the last build that
+/// went through the cache; it never keys anything.
+pub(crate) fn externs_key_field(
+    externs: &[crate::args::ExternDep],
+    file_hasher: &FileHasher<'_>,
+    mut budget: u64,
+) -> Option<String> {
+    let externs = keyed_externs(externs);
+    if externs.is_empty() {
+        return None;
+    }
+    let mut field = blake3::Hasher::new();
+    for (name, path) in externs {
+        let hash = file_hasher.hash_within(path, &mut budget)?.ok();
+        fold_extern(
+            &mut |bytes| {
+                field.update(bytes);
+            },
+            name,
+            hash.as_deref(),
+        );
+    }
+    Some(field.finalize().to_hex()[..KEY_FIELD_HEX].to_string())
+}
+
 /// Cap on entries digested for the tree guard. A crate directory past this is
 /// a build tree or a monorepo root, and the pre-pass stays cheaper than
 /// digesting it.
@@ -4255,14 +4307,13 @@ fn compute_key_into(
         tracing::trace!("[key:{}] cfg:{}", crate_name, cfg);
     }
 
-    let mut externs: Vec<_> = args.externs.iter().filter(|e| e.path.is_some()).collect();
-    externs.sort_by_key(|e| &e.name);
+    let externs = keyed_externs(&args.externs);
 
     let mut hash_paths = Vec::new();
     if let Some(dep_info) = &dep_info {
         hash_paths.extend(dep_info.source_files.iter().map(|p| p.as_path()));
     }
-    hash_paths.extend(externs.iter().filter_map(|ext| ext.path.as_deref()));
+    hash_paths.extend(externs.iter().map(|(_, path)| *path));
     file_hasher.prefetch(&hash_paths);
 
     // ── Group A: source files + env deps (from dep-info pre-pass) ──
@@ -4362,42 +4413,29 @@ fn compute_key_into(
     // name, so a renamed or duplicated dependency still joins to its producer
     // (kunobi-ninja/kache#627).
     let mut extern_units = std::collections::BTreeMap::new();
-    for ext in &externs {
-        if let Some(path) = &ext.path {
-            if let Some(unit) = crate::args::unit_id_from_artifact_path(path) {
-                extern_units.insert(ext.name.clone(), unit);
+    for &(name, path) in &externs {
+        if let Some(unit) = crate::args::unit_id_from_artifact_path(path) {
+            extern_units.insert(name.to_owned(), unit);
+        }
+        match file_hasher.hash(path) {
+            Ok(dep_hash) => {
+                fold_extern(&mut |bytes| hasher.update(bytes), name, Some(&dep_hash));
+                extern_digests.insert(
+                    name.to_owned(),
+                    dep_hash
+                        .get(..KEY_FIELD_HEX)
+                        .unwrap_or(dep_hash.as_str())
+                        .to_string(),
+                );
+                tracing::trace!("[key:{}] extern:{}={}", crate_name, name, &dep_hash[..16]);
             }
-            match file_hasher.hash(path) {
-                Ok(dep_hash) => {
-                    hasher.update(b"extern:");
-                    hasher.update(ext.name.as_bytes());
-                    hasher.update(b"=");
-                    hasher.update(dep_hash.as_bytes());
-                    hasher.update(b"\n");
-                    extern_digests.insert(
-                        ext.name.clone(),
-                        dep_hash
-                            .get(..KEY_FIELD_HEX)
-                            .unwrap_or(dep_hash.as_str())
-                            .to_string(),
-                    );
-                    tracing::trace!(
-                        "[key:{}] extern:{}={}",
-                        crate_name,
-                        ext.name,
-                        &dep_hash[..16]
-                    );
-                }
-                Err(_) => {
-                    // Sysroot crate (std, core, etc.) — identity is determined by
-                    // rustc version + name, both already in the hash. Use a sentinel
-                    // instead of the absolute path to enable cross-machine sharing.
-                    hasher.update(b"extern_unreadable:");
-                    hasher.update(ext.name.as_bytes());
-                    hasher.update(b"\n");
-                    extern_digests.insert(ext.name.clone(), EXTERN_UNREADABLE.to_string());
-                    tracing::trace!("[key:{}] extern_unreadable:{}", crate_name, ext.name);
-                }
+            Err(_) => {
+                // Sysroot crate (std, core, etc.) — identity is determined by
+                // rustc version + name, both already in the hash. Use a sentinel
+                // instead of the absolute path to enable cross-machine sharing.
+                fold_extern(&mut |bytes| hasher.update(bytes), name, None);
+                extern_digests.insert(name.to_owned(), EXTERN_UNREADABLE.to_string());
+                tracing::trace!("[key:{}] extern_unreadable:{}", crate_name, name);
             }
         }
     }
@@ -9872,6 +9910,31 @@ impl<'db> FileHasher<'db> {
     /// Hash a file's contents, using the persistent cache when available.
     pub fn hash(&self, path: &Path) -> Result<String> {
         self.hash_and_record(path).map(|recent| recent.hash)
+    }
+
+    /// [`Self::hash`] for a caller that may read at most `budget` bytes the
+    /// persistent memo cannot supply. A file the memo holds costs nothing;
+    /// any other costs its size. `None`, reading nothing, when that exceeds
+    /// what remains. A file that cannot be stated is hashed, and that fails.
+    pub(crate) fn hash_within(&self, path: &Path, budget: &mut u64) -> Option<Result<String>> {
+        let size = self
+            .resolve_path(path)
+            .and_then(|resolved| Ok(std::fs::metadata(resolved)?.len()));
+        if let Ok(size) = size
+            && !self.memoized(path)
+        {
+            *budget = budget.checked_sub(size)?;
+        }
+        Some(self.hash(path))
+    }
+
+    /// Whether the persistent memo holds `path`'s hash at its current stamp.
+    fn memoized(&self, path: &Path) -> bool {
+        let Some(cache) = &self.cache else {
+            return false;
+        };
+        self.resolve_path(path)
+            .is_ok_and(|resolved| matches!(cache.lookup_cached(&resolved), FileHashLookup::Hit(_)))
     }
 
     fn hash_and_record(&self, path: &Path) -> Result<RecentHash> {

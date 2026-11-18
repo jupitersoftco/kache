@@ -285,6 +285,51 @@ fn unselected_workspace_crates_seed_then_stay_active() {
     );
 }
 
+/// The middle crate goes active only because the library below it moved: its
+/// own sources never change. When the library returns to its cached build,
+/// as a revert or a branch switch does, the middle crate restores its cached
+/// build too, rather than compiling privately into an artifact nothing above
+/// it was cached against, and the app above it hits.
+#[test]
+fn a_revert_below_a_dependency_only_active_crate_restores_the_chain() {
+    let checkout = tempfile::tempdir().unwrap();
+    let project = checkout_path(checkout.path());
+    let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
+    let target = project.join("target");
+    create_workspace(&project);
+    let future = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3_600;
+    let build = |mtime: Option<i64>, answer| {
+        build_unselected(&project, cache.path(), &target, mtime, answer)
+    };
+    let app_events = || crate_events(cache.path(), "adaptive_app");
+
+    let (lib, mid) = build(None, 1);
+    assert_eq!(lib["result"], "miss", "event: {lib:#}");
+    assert_eq!(mid["result"], "miss", "event: {mid:#}");
+    let (_lib, mid) = build(Some(future), 2);
+    assert_passthrough(&mid, "adaptive seed");
+    let (_lib, mid) = build(Some(future + 1), 3);
+    assert_passthrough(&mid, "adaptive active");
+
+    let before_app = app_events().len();
+    let (lib, mid) = build(Some(future + 2), 1);
+    assert_eq!(lib["result"], "local_hit", "event: {lib:#}");
+    assert_eq!(mid["result"], "local_hit", "event: {mid:#}");
+    assert_eq!(mid["compiler_runs"], 0, "event: {mid:#}");
+    let app = app_events();
+    assert_eq!(app.len(), before_app + 1, "app events: {app:#?}");
+    assert_eq!(
+        app[before_app]["result"], "local_hit",
+        "event: {:#}",
+        app[before_app]
+    );
+}
+
 /// The middle crate also builds a `staticlib` and `cdylib`, so Cargo gives it
 /// no extra filename. Edits to the library below it still put it in adaptive
 /// incremental mode: the first rebuild seeds its incremental state, and later

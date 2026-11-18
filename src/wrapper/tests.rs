@@ -7072,15 +7072,15 @@ printf 'state' > "$incremental/state.bin"
     let seed = unit.try_seed(&key("second"), &fields("source-b")).unwrap();
     assert_eq!(compile(seed).unwrap(), 0);
     end_with(TYPE_ERROR);
-    assert_eq!(compile(unit.try_active().unwrap()).unwrap(), 1);
+    assert_eq!(compile(unit.try_active(|_| None).unwrap()).unwrap(), 1);
     assert!(state_kept());
     end_with("kill -KILL $$");
     let active = unit
-        .try_active()
+        .try_active(|_| None)
         .expect("a compile error keeps the unit active");
     assert_eq!(compile(active).unwrap(), 1);
     assert!(!state_kept());
-    assert!(unit.try_active().is_none());
+    assert!(unit.try_active(|_| None).is_none());
 }
 
 /// A seed runs after both lookups missed, so it takes a scheduler slot and
@@ -7173,7 +7173,7 @@ done
     assert_eq!(recorded_weights(), 1, "the seed took no slot");
 
     std::fs::remove_dir_all(&weights).unwrap();
-    assert_eq!(compile(unit.try_active().unwrap()), 0);
+    assert_eq!(compile(unit.try_active(|_| None).unwrap()), 0);
     assert_eq!(recorded_weights(), 0, "the active lane took a slot");
 }
 
@@ -14797,4 +14797,26 @@ fn preparation_records_whether_a_fresh_unit_looked_for_a_donor() {
             "automatic={automatic} explicit={explicit} unstable={unstable}"
         );
     }
+}
+
+#[test]
+fn the_active_dependency_check_names_why_it_kept_the_private_compile() {
+    use crate::args::ExternDep;
+    let artifact = ExternDep {
+        name: "dep".into(),
+        path: Some("/t/deps/libdep.rlib".into()),
+    };
+    let sysroot = ExternDep {
+        name: "std".into(),
+        path: None,
+    };
+    let both = [sysroot.clone(), artifact];
+    assert_eq!(externs_check_outcome(false, false, &both), "no store");
+    assert_eq!(externs_check_outcome(true, true, &both), "hashed");
+    assert_eq!(externs_check_outcome(true, false, &both), "over budget");
+    assert_eq!(
+        externs_check_outcome(true, false, &[sysroot]),
+        "no artifacts"
+    );
+    assert_eq!(externs_check_outcome(true, false, &[]), "no artifacts");
 }
