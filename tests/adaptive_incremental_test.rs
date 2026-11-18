@@ -823,6 +823,28 @@ fn build_files(
 /// then run active.
 #[test]
 fn a_build_script_stamping_its_sources_still_adapts() {
+    assert_a_stamping_build_script_adapts(
+        "println!(\"cargo:rustc-env=SRC_DIGEST={:x}\", hash.finish());",
+        "env!(\"SRC_DIGEST\")",
+    );
+}
+
+/// The same stamp written to a file in `OUT_DIR` that the crate reads with
+/// `include_str!`. That file is one of the unit's sources, so it moves the
+/// `sources` group with the edit, and only `build_script_inputs` besides.
+#[test]
+fn a_build_script_stamping_its_sources_into_out_dir_still_adapts() {
+    assert_a_stamping_build_script_adapts(
+        "let out = std::path::PathBuf::from(std::env::var(\"OUT_DIR\").unwrap());\n\
+         std::fs::write(out.join(\"stamp.txt\"), format!(\"{:x}\", hash.finish())).unwrap();",
+        "include_str!(concat!(env!(\"OUT_DIR\"), \"/stamp.txt\"))",
+    );
+}
+
+/// Build a fixture whose build script hashes `src/lib.rs` and publishes the
+/// digest with `publish`, and whose library reads it back with `read`, then
+/// edit it four times: a miss, a seed, then active runs.
+fn assert_a_stamping_build_script_adapts(publish: &str, read: &str) {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
@@ -830,20 +852,22 @@ fn a_build_script_stamping_its_sources_still_adapts() {
     create_fixture(project.path());
     fs::write(
         project.path().join("build.rs"),
-        "use std::hash::{Hash, Hasher};\n\
-         fn main() {\n\
-             let mut hash = std::collections::hash_map::DefaultHasher::new();\n\
-             std::fs::read(\"src/lib.rs\").unwrap().hash(&mut hash);\n\
-             println!(\"cargo:rerun-if-changed=src\");\n\
-             println!(\"cargo:rustc-env=SRC_DIGEST={:x}\", hash.finish());\n\
-         }\n",
+        format!(
+            "use std::hash::{{Hash, Hasher}};\n\
+             fn main() {{\n\
+                 let mut hash = std::collections::hash_map::DefaultHasher::new();\n\
+                 std::fs::read(\"src/lib.rs\").unwrap().hash(&mut hash);\n\
+                 println!(\"cargo:rerun-if-changed=src\");\n\
+                 {publish}\n\
+             }}\n"
+        ),
     )
     .unwrap();
 
     let first_mtime = past_mtime();
     let build = |edit: i64| {
         let source = format!(
-            "pub const STAMP: &str = env!(\"SRC_DIGEST\");\n\
+            "pub const STAMP: &str = {read};\n\
              pub fn answer() -> u64 {{ {edit} }}\n"
         );
         build_files(
