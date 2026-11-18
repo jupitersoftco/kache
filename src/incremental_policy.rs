@@ -8,7 +8,9 @@
 //! stamps its sources does. Successful seeds enable a small, time-bounded run
 //! of early passthroughs before Kache probes the cache again. A run ends early
 //! when the unit's sources move back to the last state that went through the
-//! cache, as after a revert or a branch switch. An explicit crate force-list can request the same managed
+//! cache, as after a revert or a branch switch, or when a unit whose own
+//! sources stayed there sees its dependencies move back to that build's. An
+//! explicit crate force-list can request the same managed
 //! directory without the learning step. A changed primary source can also
 //! prepare a compatible donor before key discovery. Every decision is target-local and
 //! protected by a cross-process lock held for the complete compiler invocation.
@@ -45,6 +47,11 @@ const MAX_STATE_BYTES: u64 = 64 * 1024;
 const MAX_DEP_INFO_BYTES: u64 = 1 << 20;
 /// Sources an active lease may hash before it skips the cached-source check.
 const MAX_SOURCE_BYTES: u64 = 64 << 20;
+/// Dependency artifact bytes the hash memo cannot supply that an active lease
+/// may hash before it skips the cached-externs check. A dependency rebuilt a
+/// moment ago is not in the memo yet; a large workspace library is a few
+/// hundred MiB.
+const MAX_EXTERN_BYTES: u64 = 512 << 20;
 
 /// One standard Cargo unit that is safe to manage automatically.
 #[derive(Clone, Debug)]
@@ -127,9 +134,11 @@ enum Completion {
         previous: DiskState,
     },
     /// `previous` is the state the seed found, restored if it fails.
+    /// `externs` is its key's `externs` field.
     Seed {
         observation: Observation,
         previous: DiskState,
+        externs: Option<String>,
     },
     Active {
         state: DiskState,
@@ -253,6 +262,16 @@ struct DiskState {
     /// not move since then (a dependency-only rebuild) keep the fast path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_sources: Option<String>,
+    /// The `externs` key field of the last build that went through the
+    /// cache, so a dependency-only rebuild whose dependencies return to it
+    /// looks it up. A Kache that predates it reads a state carrying it as
+    /// corrupt and relearns once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cached_externs: Option<String>,
+    /// The same field at the unit's last private compile, when known: a seed's
+    /// key, or an active compile at the cached sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_externs: Option<String>,
 }
 
 enum LoadedState {
@@ -333,8 +352,15 @@ impl AdaptiveUnit {
     }
 
     /// Try the cheap pre-key path for a previously activated unit.
-    pub(crate) fn try_active(&self) -> Option<Lease> {
-        self.try_active_at(now_secs())
+    /// `current_externs` gives the `externs` key field the unit's dependency
+    /// artifacts would key now, hashing at most the given number of bytes the
+    /// hash memo cannot supply (see [`crate::cache_key::externs_key_field`]).
+    /// It runs only for a unit whose own sources are at the cached build's.
+    pub(crate) fn try_active(
+        &self,
+        current_externs: impl FnOnce(u64) -> Option<String>,
+    ) -> Option<Lease> {
+        self.try_active_at(now_secs(), current_externs)
     }
 
     /// Try an intentional passthrough without teaching or activating policy.
@@ -379,6 +405,8 @@ impl AdaptiveUnit {
             in_flight: true,
             cached_sources: previous.cached_sources.clone(),
             last_sources: None,
+            cached_externs: previous.cached_externs.clone(),
+            last_externs: None,
         };
         if !self.store_state(&busy, true) {
             return None;
@@ -389,6 +417,7 @@ impl AdaptiveUnit {
             completion: Completion::Seed {
                 observation,
                 previous,
+                externs: None,
             },
             worktree_seed_key: None,
             worktree_seed_donor: None,
@@ -645,7 +674,11 @@ impl AdaptiveUnit {
         reset
     }
 
-    fn try_active_at(&self, now: u64) -> Option<Lease> {
+    fn try_active_at(
+        &self,
+        now: u64,
+        current_externs: impl FnOnce(u64) -> Option<String>,
+    ) -> Option<Lease> {
         // Do not create policy directories on an ordinary first compile.
         // A racing observer can safely teach this process on the next build.
         if definitely_missing(&self.state_path) {
@@ -674,6 +707,18 @@ impl AdaptiveUnit {
         if at_cached && current != state.last_sources && !beyond {
             return None;
         }
+        // Own sources still at the cached build's: a dependency-only rebuild.
+        // Dependencies back at that build's (a revert or a branch switch of a
+        // crate below) restore it too, so its dependents can hit. Not known
+        // otherwise, as after a rebuild the hash budget did not cover.
+        let externs = if at_cached && !beyond && state.cached_externs.is_some() {
+            current_externs(MAX_EXTERN_BYTES)
+        } else {
+            None
+        };
+        if externs.is_some() && externs == state.cached_externs && externs != state.last_externs {
+            return None;
+        }
 
         let mut busy = state;
         if current.is_some() {
@@ -682,6 +727,7 @@ impl AdaptiveUnit {
             // the extra files are gone.
             busy.last_sources = current.filter(|_| !beyond);
         }
+        busy.last_externs = externs;
         busy.active_leases += 1;
         busy.in_flight = true;
         if !self.store_state(&busy, true) {
@@ -728,6 +774,8 @@ impl AdaptiveUnit {
             in_flight: false,
             cached_sources: None,
             last_sources: None,
+            cached_externs: None,
+            last_externs: None,
         });
         busy.in_flight = true;
         if !self.store_state(&busy, true) {
@@ -785,6 +833,8 @@ impl AdaptiveUnit {
             in_flight: true,
             cached_sources: previous.cached_sources.clone(),
             last_sources: None,
+            cached_externs: previous.cached_externs.clone(),
+            last_externs: None,
         };
         if !self.store_state(&busy, true) {
             reset_locked(self);
@@ -796,6 +846,7 @@ impl AdaptiveUnit {
             completion: Completion::Seed {
                 observation,
                 previous,
+                externs: key_externs(fields),
             },
             worktree_seed_key: None,
             worktree_seed_donor: None,
@@ -835,6 +886,8 @@ impl AdaptiveUnit {
             in_flight: false,
             cached_sources: self.record_cached_sources(),
             last_sources: None,
+            cached_externs: key_externs(fields),
+            last_externs: None,
         };
         let stored = self.store_state(&learning, false);
         drop(lock);
@@ -1036,6 +1089,8 @@ impl AdaptiveUnit {
             in_flight: true,
             cached_sources: None,
             last_sources: None,
+            cached_externs: None,
+            last_externs: None,
         }
     }
 }
@@ -1085,6 +1140,8 @@ impl Lease {
             in_flight: true,
             cached_sources: previous.cached_sources.clone(),
             last_sources: None,
+            cached_externs: previous.cached_externs.clone(),
+            last_externs: None,
         };
         // The in-flight record already on disk covers this graph, and the
         // write replaces it with another in-flight state, so it needs no flush.
@@ -1094,6 +1151,7 @@ impl Lease {
         self.completion = Completion::Seed {
             observation,
             previous: previous.clone(),
+            externs: key_externs(fields),
         };
         true
     }
@@ -1168,6 +1226,7 @@ impl Lease {
                 Completion::Seed {
                     observation,
                     previous,
+                    externs,
                 },
                 CompileOutcome::Success,
             ) => Some(DiskState {
@@ -1183,6 +1242,8 @@ impl Lease {
                     .as_ref()
                     .and_then(|_| self.unit.private_sources_digest()),
                 cached_sources: previous.cached_sources,
+                last_externs: previous.cached_externs.as_ref().and(externs),
+                cached_externs: previous.cached_externs,
             }),
             // A failed seed leaves the unit as it found it; the next miss seeds again.
             (Completion::Seed { previous, .. }, _) => Some(previous),
@@ -1344,6 +1405,10 @@ fn valid_state(state: &DiskState, unit_key: &str) -> bool {
         .into_iter()
         .flatten()
         .any(|hash| !valid_hex_digest(hash))
+        || [&state.cached_externs, &state.last_externs]
+            .into_iter()
+            .flatten()
+            .any(|field| !valid_key_field(field))
     {
         return false;
     }
@@ -1587,6 +1652,23 @@ fn valid_hex_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// A per-group key field as [`crate::cache_key`] records it.
+fn valid_key_field(value: &str) -> bool {
+    value.len() == crate::cache_key::KEY_FIELD_HEX
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A key's `externs` field, when it has a valid one. A unit without
+/// dependency artifacts has none.
+fn key_externs(fields: &BTreeMap<String, String>) -> Option<String> {
+    fields
+        .get("externs")
+        .filter(|field| valid_key_field(field))
+        .cloned()
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1713,7 +1795,7 @@ mod tests {
         assert!(lease.finish_at(CompileOutcome::Success, 102));
         assert_ne!(fs::metadata(&unit.state_path).unwrap().ino(), inode);
         for at in [103, 105] {
-            let lease = unit.try_active_at(at).unwrap();
+            let lease = unit.try_active_at(at, |_| None).unwrap();
             assert_eq!(fs::metadata(&unit.state_path).unwrap().ino(), inode);
             assert!(lease.finish_at(CompileOutcome::Success, at + 1));
         }
@@ -2146,7 +2228,7 @@ mod tests {
         assert!(read_state(&unit).in_flight);
         assert!(path_exists(&scratch));
         assert!(unit.try_deferred_seed().is_none());
-        assert!(unit.try_active_at(102).is_none());
+        assert!(unit.try_active_at(102, |_| None).is_none());
     }
 
     #[test]
@@ -2164,7 +2246,7 @@ mod tests {
                     .unwrap(),
                 LeaseKind::Active => {
                     activate(&unit, 100);
-                    unit.try_active_at(103).unwrap()
+                    unit.try_active_at(103, |_| None).unwrap()
                 }
                 LeaseKind::Immediate => unit.try_immediate_at(101).unwrap(),
             };
@@ -2199,7 +2281,7 @@ mod tests {
                     "{outcome:?}, graph {wrote_graph}"
                 );
                 assert!(!path_exists(&unit.rustc_dir));
-                assert!(unit.try_active_at(102).is_none());
+                assert!(unit.try_active_at(102, |_| None).is_none());
                 if outcome == CompileOutcome::Success {
                     assert!(!path_exists(&unit.state_path));
                     assert!(unit.try_deferred_seed().is_none());
@@ -2239,13 +2321,13 @@ mod tests {
                         assert_eq!(active.phase, Phase::Active);
                         assert!(!active.in_flight);
                         assert_eq!(active.observation.unwrap().cache_key, cache_key("second"));
-                        assert!(unit.try_active_at(102).is_some());
+                        assert!(unit.try_active_at(102, |_| None).is_some());
                     }
                     CompileOutcome::CompileError => {
                         assert!(kept);
                         assert_eq!(fs::read(&unit.state_path).unwrap(), before);
                         assert!(real_directory(&unit.rustc_dir));
-                        assert!(unit.try_active_at(102).is_none());
+                        assert!(unit.try_active_at(102, |_| None).is_none());
                     }
                     _ => {
                         assert!(!kept);
@@ -2276,7 +2358,7 @@ mod tests {
             assert!(unit.try_deferred_seed().is_none());
             assert!(!path_exists(&unit.state_path));
             assert!(!path_exists(&unit.rustc_dir));
-            assert!(unit.try_active_at(102).is_none());
+            assert!(unit.try_active_at(102, |_| None).is_none());
         }
     }
 
@@ -3007,12 +3089,12 @@ mod tests {
 
         edit("second edit");
         let lease = unit
-            .try_active_at(103)
+            .try_active_at(103, |_| None)
             .expect("a real edit keeps the fast path");
         assert!(lease.finish_at(CompileOutcome::Success, 104));
 
         edit("cached");
-        assert!(unit.try_active_at(105).is_none());
+        assert!(unit.try_active_at(105, |_| None).is_none());
         let state = read_state(&unit);
         assert_eq!((state.phase, state.in_flight), (Phase::Active, false));
         assert!(nonempty_real_directory(&unit.rustc_dir));
@@ -3034,17 +3116,261 @@ mod tests {
         assert!(seed.finish_at(CompileOutcome::Success, 102));
         for at in [103, 105] {
             let lease = unit
-                .try_active_at(at)
+                .try_active_at(at, |_| None)
                 .expect("unchanged sources stay active");
             assert!(lease.finish_at(CompileOutcome::Success, at + 1));
         }
 
         // Moving away and back is a return to the cached sources.
         fs::write(checkout.join("src/a.rs"), "edited").unwrap();
-        let lease = unit.try_active_at(107).unwrap();
+        let lease = unit.try_active_at(107, |_| None).unwrap();
         assert!(lease.finish_at(CompileOutcome::Success, 108));
         fs::write(checkout.join("src/a.rs"), "cached").unwrap();
-        assert!(unit.try_active_at(109).is_none());
+        assert!(unit.try_active_at(109, |_| None).is_none());
+    }
+
+    /// An `externs` key field.
+    fn externs(label: &str) -> String {
+        blake3::hash(label.as_bytes()).to_hex()[..crate::cache_key::KEY_FIELD_HEX].to_string()
+    }
+
+    /// Teach the unit a cached build keyed with `externs("cached")`, then
+    /// seed it after a rebuild keyed with `seed_externs` that left its own
+    /// sources alone.
+    fn activate_by_dependency(unit: &AdaptiveUnit, seed_externs: &str) {
+        activate_keyed(unit, "source-a", seed_externs);
+    }
+
+    /// [`activate_by_dependency`] whose seed's key has `seed_sources`. Only
+    /// the key moves: the files on disk stay those of the cached build.
+    fn activate_keyed(unit: &AdaptiveUnit, seed_sources: &str, seed_externs: &str) {
+        assert!(unit.observe_build_at(
+            &cache_key("first"),
+            &fields("stable", "source-a", &externs("cached")),
+            100,
+        ));
+        let seed = unit
+            .try_seed_at(
+                &cache_key("second"),
+                &fields("stable", seed_sources, seed_externs),
+                101,
+            )
+            .unwrap();
+        fs::write(seed.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
+        assert!(seed.finish_at(CompileOutcome::Success, 102));
+    }
+
+    /// (a) A unit active only because a dependency moved, whose dependencies
+    /// return to the cached build's (a revert below it), looks the cache up,
+    /// so its restored artifact lets its dependents hit. The key path keeps
+    /// the state for a miss.
+    #[test]
+    fn a_dependency_only_unit_whose_dependencies_return_looks_up_the_cache() {
+        let (_temp, _checkout, unit) = fixture_with_sources();
+        activate_by_dependency(&unit, &externs("edit-1"));
+        let state = read_state(&unit);
+        assert_eq!(state.cached_externs, Some(externs("cached")));
+        assert_eq!(state.last_externs, Some(externs("edit-1")));
+
+        let budget = std::cell::Cell::new(None);
+        let lease = unit
+            .try_active_at(103, |offered| {
+                budget.set(Some(offered));
+                Some(externs("edit-2"))
+            })
+            .expect("a dependency still moved keeps the fast path");
+        assert_eq!(budget.get(), Some(MAX_EXTERN_BYTES));
+        assert!(lease.finish_at(CompileOutcome::Success, 104));
+        assert_eq!(read_state(&unit).last_externs, Some(externs("edit-2")));
+
+        assert!(
+            unit.try_active_at(105, |_| Some(externs("cached")))
+                .is_none()
+        );
+        let state = read_state(&unit);
+        assert_eq!((state.phase, state.in_flight), (Phase::Active, false));
+        assert_eq!(state.last_externs, Some(externs("edit-2")));
+        assert!(nonempty_real_directory(&unit.rustc_dir));
+    }
+
+    /// (b) Dependencies that did not move since the last private compile
+    /// keep the fast path even at the cached build's, as sources do.
+    #[test]
+    fn dependencies_unmoved_since_the_last_private_compile_keep_the_fast_path() {
+        let (_temp, _checkout, unit) = fixture_with_sources();
+        activate_keyed(&unit, "source-b", &externs("cached"));
+        let lease = unit
+            .try_active_at(103, |_| Some(externs("cached")))
+            .expect("nothing returned");
+        assert!(lease.finish_at(CompileOutcome::Success, 104));
+        assert_eq!(read_state(&unit).last_externs, Some(externs("cached")));
+    }
+
+    /// (c) Dependency artifacts are hashed only when the unit's own sources
+    /// are at the cached build's and that build recorded an `externs` field.
+    /// Otherwise the last field is unknown.
+    #[test]
+    fn dependencies_are_hashed_only_at_the_cached_sources() {
+        let unasked = |_| -> Option<String> { panic!("dependency artifacts hashed") };
+        let (_temp, checkout, unit) = fixture_with_sources();
+        activate_by_dependency(&unit, &externs("edit-1"));
+        fs::write(checkout.join("src/a.rs"), "edited").unwrap();
+        let lease = unit
+            .try_active_at(103, unasked)
+            .expect("an edit runs active");
+        assert!(lease.finish_at(CompileOutcome::Success, 104));
+        assert_eq!(read_state(&unit).last_externs, None);
+
+        // A cached build whose key recorded no valid field.
+        let (_temp, _checkout, unit) = fixture_with_sources();
+        activate_by_dependency(&unit, "extern-b");
+        let mut state = read_state(&unit);
+        state.cached_externs = None;
+        write_state(&unit, &state);
+        let lease = unit.try_active_at(103, unasked).unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, 104));
+
+        // Sources beyond the cached files are not the cached ones.
+        let (_temp, checkout, unit) = fixture_with_sources();
+        activate_by_dependency(&unit, &externs("edit-1"));
+        fs::write(checkout.join("src/extra.rs"), "extra").unwrap();
+        compiled(&unit, &["src/lib.rs", "src/a.rs", "src/extra.rs"]);
+        let lease = unit.try_active_at(103, unasked).unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, 104));
+    }
+
+    /// (d) Dependencies the budget did not cover keep today's fast path, and
+    /// leave the last field unknown, so a later return within it looks up.
+    #[test]
+    fn dependencies_past_the_budget_keep_the_fast_path() {
+        let (_temp, _checkout, unit) = fixture_with_sources();
+        activate_by_dependency(&unit, &externs("edit-1"));
+        let lease = unit.try_active_at(103, |_| None).unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, 104));
+        assert_eq!(read_state(&unit).last_externs, None);
+        assert!(
+            unit.try_active_at(105, |_| Some(externs("cached")))
+                .is_none()
+        );
+    }
+
+    /// (e) Each transition records the `externs` field it knows: a build
+    /// through the cache its own, a seed carries it and records its key's,
+    /// a failed seed restores what it found, and a seed before key discovery
+    /// knows none. A key without a valid field records none.
+    #[test]
+    fn transitions_record_the_externs_field_they_know() {
+        let (_temp, _checkout, unit) = fixture_with_sources();
+        activate_by_dependency(&unit, &externs("edit-1"));
+        let failed = unit
+            .try_seed_at(
+                &cache_key("third"),
+                &fields("stable", "source-c", &externs("edit-2")),
+                103,
+            )
+            .unwrap();
+        assert!(failed.finish_at(CompileOutcome::CompileError, 104));
+        let state = read_state(&unit);
+        assert_eq!(state.last_externs, Some(externs("edit-1")));
+
+        assert!(unit.observe_build_at(
+            &cache_key("fourth"),
+            &fields("stable", "source-d", &externs("hit")),
+            105,
+        ));
+        let state = read_state(&unit);
+        assert_eq!(
+            (state.cached_externs, state.last_externs),
+            (Some(externs("hit")), None)
+        );
+
+        let (_temp, _checkout, unit) = fixture_with_sources();
+        assert!(unit.observe_build_at(
+            &cache_key("first"),
+            &fields("stable", "source-a", "EXTERN-NOT-HEX"),
+            100,
+        ));
+        assert_eq!(read_state(&unit).cached_externs, None);
+
+        let (_temp, _checkout, unit) = fixture_with_sources();
+        assert!(unit.observe_build_at(
+            &cache_key("first"),
+            &fields("stable", "source-a", &externs("cached")),
+            100,
+        ));
+        let mut lease = unit.try_deferred_seed().unwrap();
+        assert!(lease.qualify_deferred_seed_at(
+            &cache_key("second"),
+            &fields("stable", "source-a", &externs("edit-1")),
+            101,
+        ));
+        fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, 102));
+        let state = read_state(&unit);
+        assert_eq!(
+            (state.cached_externs, state.last_externs),
+            (Some(externs("cached")), Some(externs("edit-1")))
+        );
+    }
+
+    /// (e) A seed before key discovery knows no `externs` field.
+    #[test]
+    fn a_seed_before_key_discovery_knows_no_externs_field() {
+        let (_temp, checkout, unit) = fixture_with_sources();
+        fs::write(checkout.join("src/lib.rs"), "mod a; // first").unwrap();
+        assert!(unit.observe_build_at(
+            &cache_key("first"),
+            &fields("stable", "source-a", &externs("cached")),
+            100,
+        ));
+        fs::write(checkout.join("src/lib.rs"), "mod a; // edited").unwrap();
+        let lease = unit.try_source_changed_seed().unwrap();
+        fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, now_secs()));
+        let state = read_state(&unit);
+        assert_eq!(
+            (state.phase, state.cached_externs, state.last_externs),
+            (Phase::Active, Some(externs("cached")), None)
+        );
+    }
+
+    /// (f) A state whose `externs` fields are not key fields is corrupt: the
+    /// lease resets the unit. A state without them, as an older Kache wrote
+    /// it, still loads, and one that has none writes none.
+    #[test]
+    fn externs_fields_fail_closed() {
+        for invalid in [
+            "ABCDEF0123456789".to_string(),
+            "0123456789abcde".to_string(),
+            "0123456789abcdef0".to_string(),
+            "0123456789abcdeg".to_string(),
+            externs("x").repeat(4),
+        ] {
+            let slots: [fn(&mut DiskState) -> &mut Option<String>; 2] =
+                [|s| &mut s.cached_externs, |s| &mut s.last_externs];
+            for slot in slots {
+                let (_temp, _checkout, unit) = fixture_with_sources();
+                activate_by_dependency(&unit, &externs("edit-1"));
+                let mut state = read_state(&unit);
+                *slot(&mut state) = Some(invalid.clone());
+                assert!(!valid_state(&state, &unit.unit_key), "{invalid}");
+                write_state(&unit, &state);
+                assert!(
+                    unit.try_active_at(103, |_| Some(externs("edit-2")))
+                        .is_none()
+                );
+                assert!(!unit.state_path.exists(), "{invalid} reset the unit");
+            }
+        }
+        assert!(valid_key_field(&externs("x")));
+
+        let (_temp, _checkout, unit) = fixture_with_sources();
+        activate(&unit, 100);
+        let bytes = fs::read(&unit.state_path).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("cached_externs"), "{text}");
+        assert!(!text.contains("last_externs"), "{text}");
+        assert!(matches!(unit.load_state(), LoadedState::Valid(_)));
     }
 
     /// Write each `(path, contents)` under `checkout`, deleting it for `None`.
@@ -3098,7 +3424,7 @@ mod tests {
         seed_from(&unit, &["src/lib.rs", "src/a.rs"], 101);
 
         check_out(&checkout, &with_b);
-        assert!(unit.try_active_at(103).is_none());
+        assert!(unit.try_active_at(103, |_| None).is_none());
         let state = read_state(&unit);
         assert_eq!((state.phase, state.in_flight), (Phase::Active, false));
     }
@@ -3123,11 +3449,11 @@ mod tests {
             &checkout,
             &[("src/lib.rs", Some("mod a;")), ("src/c.rs", None)],
         );
-        assert!(unit.try_active_at(103).is_none());
+        assert!(unit.try_active_at(103, |_| None).is_none());
 
         check_out(&checkout, &[("src/a.rs", None)]);
         let lease = unit
-            .try_active_at(104)
+            .try_active_at(104, |_| None)
             .expect("a cached file that is gone is not a return");
         assert!(lease.finish_at(CompileOutcome::Success, 105));
     }
@@ -3144,7 +3470,7 @@ mod tests {
         fs::remove_file(unit.cached_dep_info()).unwrap();
 
         check_out(&checkout, &[("src/a.rs", Some("cached"))]);
-        assert!(unit.try_active_at(103).is_none());
+        assert!(unit.try_active_at(103, |_| None).is_none());
 
         teach(&unit, 105);
         assert!(unit.cached_dep_info().is_file());
@@ -3169,10 +3495,12 @@ mod tests {
         edit("first edit");
         seed_from(&unit, &["src/lib.rs", "src/a.rs"], 102);
         edit("second edit");
-        let lease = unit.try_active_at(104).expect("an edit runs active");
+        let lease = unit
+            .try_active_at(104, |_| None)
+            .expect("an edit runs active");
         assert!(lease.finish_at(CompileOutcome::Success, 105));
         edit("cached");
-        assert!(unit.try_active_at(106).is_none());
+        assert!(unit.try_active_at(106, |_| None).is_none());
 
         // An unqualified success clears learning, copy included.
         teach(&unit, 107);
@@ -3193,17 +3521,19 @@ mod tests {
         seed_from(&unit, &["src/lib.rs", "src/a.rs", "src/data.txt"], 101);
 
         check_out(&checkout, &[("src/a.rs", Some("edited"))]);
-        let lease = unit.try_active_at(103).expect("an edit runs active");
+        let lease = unit
+            .try_active_at(103, |_| None)
+            .expect("an edit runs active");
         assert!(lease.finish_at(CompileOutcome::Success, 104));
         check_out(&checkout, &[("src/a.rs", Some("cached"))]);
         let lease = unit
-            .try_active_at(105)
+            .try_active_at(105, |_| None)
             .expect("the added file still exists");
         assert!(lease.finish_at(CompileOutcome::Success, 106));
 
         // Once it is gone, the sources are the cached ones again.
         check_out(&checkout, &[("src/data.txt", None)]);
-        assert!(unit.try_active_at(107).is_none());
+        assert!(unit.try_active_at(107, |_| None).is_none());
     }
 
     /// The same for a seed whose compile read the extra file: removing it
@@ -3217,7 +3547,7 @@ mod tests {
         assert_eq!(read_state(&unit).last_sources, None);
 
         check_out(&checkout, &[("src/data.txt", None)]);
-        assert!(unit.try_active_at(103).is_none());
+        assert!(unit.try_active_at(103, |_| None).is_none());
     }
 
     #[test]
@@ -3403,7 +3733,7 @@ mod tests {
         fs::write(lease.unit.rustc_dir.join("query-cache.bin"), b"seed").unwrap();
         assert!(lease.finish_at(CompileOutcome::Success, 121));
 
-        let active = unit.try_active_at(122).unwrap();
+        let active = unit.try_active_at(122, |_| None).unwrap();
         assert_eq!(active.kind(), LeaseKind::Active);
         let busy = read_state(&unit);
         assert!(busy.in_flight);
@@ -3469,7 +3799,7 @@ mod tests {
         // the active path: a deleted Unavailable arm in any of them falls
         // through to the Corrupt arm and destroys the state file.
         assert!(
-            unit.try_active_at(103).is_none(),
+            unit.try_active_at(103, |_| None).is_none(),
             "active: decline while the state cannot be read"
         );
         assert!(
@@ -3493,7 +3823,7 @@ mod tests {
         // Pressure gone: the learned state is intact and still activates.
         fs::set_permissions(&unit.state_path, readable).unwrap();
         let lease = unit
-            .try_active_at(104)
+            .try_active_at(104, |_| None)
             .expect("learned state survived the transient refusal");
         assert_eq!(lease.kind(), LeaseKind::Active);
         assert!(lease.finish_at(CompileOutcome::Success, 105));
@@ -3521,7 +3851,7 @@ mod tests {
         state.in_flight = true;
         write_state(&unit, &state);
 
-        assert!(unit.try_active_at(13).is_none());
+        assert!(unit.try_active_at(13, |_| None).is_none());
     }
 
     #[test]
@@ -3540,7 +3870,7 @@ mod tests {
                     }
                     LeaseKind::Active => {
                         activate(&unit, 10);
-                        unit.try_active_at(13)
+                        unit.try_active_at(13, |_| None)
                     }
                     LeaseKind::Immediate => unit.try_immediate_at(13),
                 }
@@ -3553,7 +3883,7 @@ mod tests {
                 // Model a power loss that retained the durable pre-compile
                 // marker but lost the later atomic completion rename.
                 crate::atomic::atomic_replace_deferrable(&unit.state_path, &busy, false).unwrap();
-                assert!(unit.try_active_at(15).is_none());
+                assert!(unit.try_active_at(15, |_| None).is_none());
                 assert!(!path_exists(&unit.rustc_dir));
                 assert!(unit.try_immediate_at(16).is_some());
             }
@@ -3648,6 +3978,8 @@ mod tests {
             in_flight: false,
             cached_sources: None,
             last_sources: None,
+            cached_externs: None,
+            last_externs: None,
         };
 
         assert!(active_lease_allowed(&state, 100 + ACTIVE_IDLE_SECS, true));
@@ -3674,7 +4006,7 @@ mod tests {
             )
             .unwrap();
         assert!(!lease.finish_at(CompileOutcome::Success, 12));
-        assert!(unit.try_active_at(13).is_none());
+        assert!(unit.try_active_at(13, |_| None).is_none());
         assert!(!unit.state_path.exists());
     }
 
@@ -3737,7 +4069,7 @@ mod tests {
     fn active_compile_error_keeps_the_lease_and_rustc_state() {
         let (_temp, _args, unit) = fixture();
         activate(&unit, 10);
-        let lease = unit.try_active_at(12).unwrap();
+        let lease = unit.try_active_at(12, |_| None).unwrap();
         fs::create_dir(unit.rustc_dir.join("s-working")).unwrap();
 
         assert!(lease.finish_at(CompileOutcome::CompileError, 13));
@@ -3750,7 +4082,7 @@ mod tests {
         );
         assert_eq!(state.last_used_secs, 13);
         assert!(unit.rustc_dir.join("dep-graph.bin").is_file());
-        assert!(unit.try_active_at(14).is_some());
+        assert!(unit.try_active_at(14, |_| None).is_some());
     }
 
     #[test]
@@ -3773,7 +4105,7 @@ mod tests {
             assert!(lease.finish_at(CompileOutcome::CompileError, 121));
             assert_eq!(fs::read(&unit.state_path).unwrap(), learned);
             assert!(unit.rustc_dir.is_dir());
-            assert!(unit.try_active_at(122).is_none());
+            assert!(unit.try_active_at(122, |_| None).is_none());
             let fixed = unit
                 .try_seed_at(
                     &cache_key("fixed"),
@@ -3793,7 +4125,7 @@ mod tests {
         exhausted.active_leases = MAX_ACTIVE_LEASES;
         write_state(&unit, &exhausted);
         let saved = fs::read(&unit.state_path).unwrap();
-        assert!(unit.try_active_at(11).is_none());
+        assert!(unit.try_active_at(11, |_| None).is_none());
 
         let lease = unit
             .try_seed_at(
@@ -3830,7 +4162,7 @@ mod tests {
             let (_temp, _args, unit) = fixture();
             activate(&unit, 10);
             let lease = match kind {
-                LeaseKind::Active => unit.try_active_at(12),
+                LeaseKind::Active => unit.try_active_at(12, |_| None),
                 LeaseKind::Seed => unit.try_seed_at(
                     &cache_key("third"),
                     &fields("stable", "source-c", "extern-a"),
@@ -4067,6 +4399,8 @@ mod tests {
                     in_flight: true,
                     cached_sources: None,
                     last_sources: None,
+                    cached_externs: None,
+                    last_externs: None,
                 };
                 fs::write(&unit.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
             } else {
@@ -4076,7 +4410,7 @@ mod tests {
             let lease = if interrupted {
                 unit.try_immediate_at(12)
             } else {
-                unit.try_active_at(12)
+                unit.try_active_at(12, |_| None)
             };
             assert!(lease.is_none());
             // Lock/reset can fail transiently under host resource pressure.
@@ -4133,7 +4467,7 @@ mod tests {
             &fields("stable", "source-c", "extern-a"),
             12,
         );
-        let leased = unit.try_active_at(13);
+        let leased = unit.try_active_at(13, |_| None);
         fs::set_permissions(&stuck, fs::Permissions::from_mode(0o700)).unwrap();
 
         assert!(!observed, "the removal failed, so nothing was observed");
@@ -4178,7 +4512,7 @@ mod tests {
             "rustc/ must stay whole beside the state it belongs to"
         );
         let lease = unit
-            .try_active_at(13)
+            .try_active_at(13, |_| None)
             .expect("a whole rustc directory may still be leased");
         assert!(lease.finish_at(CompileOutcome::Success, 14));
     }
@@ -4325,7 +4659,9 @@ mod tests {
         ));
         assert!(lease.finish_at(CompileOutcome::Success, 102));
         for at in [103, 105, 107] {
-            let lease = unit.try_active_at(at).expect("later edits run active");
+            let lease = unit
+                .try_active_at(at, |_| None)
+                .expect("later edits run active");
             assert!(lease.finish_at(CompileOutcome::Success, at + 1));
         }
 

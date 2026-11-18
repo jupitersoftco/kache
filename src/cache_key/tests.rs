@@ -19347,6 +19347,153 @@ fn key_computation_returns_unit_identity() {
     assert!(outputs.fields.is_some(), "per-group digests too");
 }
 
+/// A unit's `--extern`s: `foo`'s artifact exists with known bytes, `std`'s
+/// cannot be read. Both are named after a path in `dir`.
+fn extern_args(dir: &Path) -> RustcArgs {
+    std::fs::write(dir.join("libfoo-0532daf0ee3516f0.rlib"), b"foo-rlib").unwrap();
+    let args: Vec<String> = [
+        "rustc".to_string(),
+        "--crate-name".into(),
+        "app".into(),
+        "src/lib.rs".into(),
+        "--extern".into(),
+        format!("std={}", dir.join("missing/libstd.rlib").display()),
+        "--extern".into(),
+        format!("foo={}", dir.join("libfoo-0532daf0ee3516f0.rlib").display()),
+        "--extern".into(),
+        "proc_macro".into(),
+    ]
+    .into_iter()
+    .collect();
+    let mut parsed = RustcArgs::parse(&args).unwrap();
+    parsed.source_file = None;
+    parsed
+}
+
+/// The `externs` key group folds, by crate name, `extern:<name>=<hash>\n`
+/// for a readable artifact and `extern_unreadable:<name>\n` for any other,
+/// and nothing for an extern without a path. Pinned byte for byte: these
+/// bytes are in every cache key.
+#[test]
+fn the_externs_key_group_keeps_its_bytes() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let parsed = extern_args(dir.path());
+    let (key, outputs) = compute_cache_key_with_outputs(
+        &parsed,
+        &FileHasher::new(),
+        &PathNormalizer::empty(),
+        &KeyEnv::default(),
+    );
+    key.unwrap();
+
+    let mut group = b"extern:foo=".to_vec();
+    group.extend_from_slice(blake3::hash(b"foo-rlib").to_hex().as_bytes());
+    group.extend_from_slice(b"\nextern_unreadable:std\n");
+    let expected = blake3::hash(&group).to_hex()[..KEY_FIELD_HEX].to_string();
+    let fields = outputs.fields.unwrap();
+    assert_eq!(fields.get("externs"), Some(&expected));
+}
+
+/// Adaptive incremental judges a dependency return by the field a key would
+/// record. Without it the comparison would never match a cached build.
+#[test]
+fn externs_key_field_is_the_field_a_key_records() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let parsed = extern_args(dir.path());
+    let hasher = FileHasher::new();
+    let (key, outputs) = compute_cache_key_with_outputs(
+        &parsed,
+        &hasher,
+        &PathNormalizer::empty(),
+        &KeyEnv::default(),
+    );
+    key.unwrap();
+    let fields = outputs.fields.unwrap();
+    assert_eq!(
+        externs_key_field(&parsed.externs, &FileHasher::new(), u64::MAX).as_ref(),
+        fields.get("externs"),
+    );
+
+    std::fs::write(dir.path().join("libfoo-0532daf0ee3516f0.rlib"), b"rebuilt").unwrap();
+    assert_ne!(
+        externs_key_field(&parsed.externs, &FileHasher::new(), u64::MAX).as_ref(),
+        fields.get("externs"),
+        "a rebuilt dependency moves the field"
+    );
+}
+
+#[test]
+fn externs_key_field_needs_an_artifact_and_the_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let parsed = extern_args(dir.path());
+    let hasher = FileHasher::new();
+    let size = b"foo-rlib".len() as u64;
+    assert!(externs_key_field(&parsed.externs, &hasher, size).is_some());
+    assert_eq!(externs_key_field(&parsed.externs, &hasher, size - 1), None);
+
+    let mut no_artifacts = parsed.clone();
+    no_artifacts.externs.retain(|ext| ext.path.is_none());
+    assert_eq!(
+        externs_key_field(&no_artifacts.externs, &hasher, u64::MAX),
+        None
+    );
+}
+
+/// A file the memo holds costs nothing; any other costs its size, and only a
+/// budget that covers it reads it.
+#[test]
+fn hash_within_spends_its_budget_only_on_files_the_memo_lacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("lib.rlib");
+    let bytes = vec![7u8; MIN_PERSISTED_HASH_BYTES as usize];
+    std::fs::write(&file, &bytes).unwrap();
+    let size = bytes.len() as u64;
+    let expected = blake3::hash(&bytes).to_hex().to_string();
+
+    let hasher = FileHasher::new();
+    let mut budget = size - 1;
+    assert!(hasher.hash_within(&file, &mut budget).is_none());
+    assert_eq!(budget, size - 1, "a refusal spends nothing");
+    assert_eq!(hasher.stats().bytes_hashed, 0, "and reads nothing");
+    let mut budget = size + 3;
+    assert_eq!(
+        hasher.hash_within(&file, &mut budget).unwrap().unwrap(),
+        expected
+    );
+    assert_eq!(budget, 3);
+
+    let mut budget = 5;
+    assert!(
+        hasher
+            .hash_within(&dir.path().join("missing.rlib"), &mut budget)
+            .unwrap()
+            .is_err(),
+        "a file that cannot be stated is hashed, and fails"
+    );
+    assert_eq!(budget, 5);
+
+    let db = dir.path().join("idx.sqlite");
+    let cache = FileHashCache::open(&db).unwrap();
+    cache
+        .put(&FileFingerprint::from_path(&file).unwrap(), "memoised")
+        .unwrap();
+    drop(cache);
+    let memoised = FileHasher::persistent(&db);
+    let mut budget = 0;
+    assert_eq!(
+        memoised.hash_within(&file, &mut budget).unwrap().unwrap(),
+        "memoised"
+    );
+    assert_eq!(budget, 0);
+    std::fs::write(&file, b"changed").unwrap();
+    assert!(
+        memoised.hash_within(&file, &mut budget).is_none(),
+        "a row for other bytes is no memo"
+    );
+}
+
 /// True if a bare `rustc` is invocable. `compute_cache_key` forks
 /// rustc for the version probe and dep-info pre-pass; without it
 /// the key still computes (the pre-pass falls back) but the

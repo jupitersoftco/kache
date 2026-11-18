@@ -6932,15 +6932,15 @@ printf 'state' > "$incremental/state.bin"
     let seed = unit.try_seed(&key("second"), &fields("source-b")).unwrap();
     assert_eq!(compile(seed).unwrap(), 0);
     end_with(TYPE_ERROR);
-    assert_eq!(compile(unit.try_active().unwrap()).unwrap(), 1);
+    assert_eq!(compile(unit.try_active(|_| None).unwrap()).unwrap(), 1);
     assert!(state_kept());
     end_with("kill -KILL $$");
     let active = unit
-        .try_active()
+        .try_active(|_| None)
         .expect("a compile error keeps the unit active");
     assert_eq!(compile(active).unwrap(), 1);
     assert!(!state_kept());
-    assert!(unit.try_active().is_none());
+    assert!(unit.try_active(|_| None).is_none());
 }
 
 /// A seed runs after both lookups missed, so it takes a scheduler slot and
@@ -7033,7 +7033,7 @@ done
     assert_eq!(recorded_weights(), 1, "the seed took no slot");
 
     std::fs::remove_dir_all(&weights).unwrap();
-    assert_eq!(compile(unit.try_active().unwrap()), 0);
+    assert_eq!(compile(unit.try_active(|_| None).unwrap()), 0);
     assert_eq!(recorded_weights(), 0, "the active lane took a slot");
 }
 

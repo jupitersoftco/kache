@@ -4163,6 +4163,9 @@ fn run_parsed_rustc(
         crate::cache_key::dep_info_provided(),
     );
 
+    // A store the active lane opened to hash dependency artifacts through the
+    // memo, kept for the key path when that lane declines.
+    let mut opened_store = None;
     if incremental_fast_path_allowed(
         unit_refuses_caching(!refuse.is_empty(), untrusted_codegen_backend.is_some()),
         excluded_source.is_some() || user_bypass.is_some(),
@@ -4183,7 +4186,10 @@ fn run_parsed_rustc(
                     key_record,
                 );
             }
-        } else if let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_active) {
+        } else if let Some(lease) = adaptive_unit.as_ref().and_then(|unit| {
+            unit.try_active(|budget| current_externs_field(config, args, &mut opened_store, budget))
+        }) {
+            drop(opened_store.take());
             return adaptive_incremental_with_event(
                 config,
                 args,
@@ -4221,7 +4227,9 @@ fn run_parsed_rustc(
     let mut fallback_stores = Vec::new();
     let trace_store_open = crate::phase_trace::phase("store_open");
     let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
-        match open_primary_and_fallback_for(config, &rustc_route, args.invocation_env()) {
+        match opened_store.take().unwrap_or_else(|| {
+            open_primary_and_fallback_for(config, &rustc_route, args.invocation_env())
+        }) {
             Ok((primary, fallbacks)) => {
                 fallback_stores = fallbacks;
                 Some(primary)
@@ -8795,6 +8803,37 @@ fn passthrough_args(
         fallback: false,
         fallback_attempt,
     })
+}
+
+/// The `externs` key field of an active unit's dependency artifacts as they
+/// are now, hashed through the store's memo within `budget` bytes it cannot
+/// supply. The store opened for it is left in `opened` for the key path.
+fn current_externs_field(
+    config: &Config,
+    args: &RustcArgs,
+    opened: &mut Option<Result<(Store, Vec<Store>)>>,
+    budget: u64,
+) -> Option<String> {
+    let start = std::time::Instant::now();
+    let route = volume_route_path_rustc(args);
+    let (store, _) = opened
+        .insert(open_primary_and_fallback_for(
+            config,
+            &route,
+            args.invocation_env(),
+        ))
+        .as_ref()
+        .ok()?;
+    let hasher = store.file_hasher_for(args.invocation_env());
+    let field = crate::cache_key::externs_key_field(&args.externs, &hasher, budget);
+    tracing::debug!(
+        crate_name = args.crate_name.as_deref().unwrap_or("unknown"),
+        field = field.as_deref().unwrap_or("none"),
+        bytes_hashed = hasher.stats().bytes_hashed,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "adaptive active: dependency artifacts hashed"
+    );
+    field
 }
 
 /// A hit restored a unit's outputs without its incremental state. Count it as
