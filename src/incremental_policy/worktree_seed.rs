@@ -411,14 +411,11 @@ fn import(receiver: &AdaptiveUnit, profile: &Path, key: &str) -> bool {
         let marker = donor.unit_dir.join(MARKER);
         if !fs::symlink_metadata(&marker).is_ok_and(|meta| meta.is_file() && meta.len() == 64)
             || fs::read_to_string(marker).ok().as_deref() != Some(key)
-            || !matches!(
-                donor.load_state(),
-                LoadedState::Missing
-                    | LoadedState::Valid(DiskState {
-                        in_flight: false,
-                        ..
-                    })
-            )
+            || !match donor.load_state() {
+                LoadedState::Missing => true,
+                LoadedState::Valid(state) => !state.in_flight,
+                LoadedState::Corrupt | LoadedState::Unavailable => false,
+            }
             || !real_directory(&donor.rustc_dir)
         {
             continue;

@@ -785,6 +785,155 @@ fn local_failed_cold_seed_keeps_the_next_fix_on_the_seed_lane() {
     assert_eq!(active["dep_info_runs"], 0, "event: {active:#}");
 }
 
+/// Write each `(path, contents)` under `project`, deleting it for `None`,
+/// dated `mtime`, then build and return the fixture's one event.
+fn build_files(
+    project: &Path,
+    cache_dir: &Path,
+    target_dir: &Path,
+    mtime: i64,
+    files: &[(&str, Option<&str>)],
+) -> Value {
+    for (path, contents) in files {
+        let path = project.join(path);
+        match contents {
+            Some(contents) => {
+                fs::write(&path, contents).unwrap();
+                filetime::set_file_mtime(&path, FileTime::from_unix_time(mtime, 0)).unwrap();
+            }
+            None => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    let event_count = fixture_events(cache_dir).len();
+    let output = run_cargo(project, cache_dir, target_dir, None);
+    assert!(
+        output.status.success(),
+        "fixture build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    only_new_event(cache_dir, event_count)
+}
+
+/// A build script that reruns on every edit and stamps a digest of `src/`
+/// into `cargo:rustc-env` moves the unit's `env_deps` and
+/// `build_script_inputs` key groups with each edit. The edits still seed and
+/// then run active.
+#[test]
+fn a_build_script_stamping_its_sources_still_adapts() {
+    assert_a_stamping_build_script_adapts(
+        "println!(\"cargo:rustc-env=SRC_DIGEST={:x}\", hash.finish());",
+        "env!(\"SRC_DIGEST\")",
+    );
+}
+
+/// The same stamp written to a file in `OUT_DIR` that the crate reads with
+/// `include_str!`. That file is one of the unit's sources, so it moves the
+/// `sources` group with the edit, and only `build_script_inputs` besides.
+#[test]
+fn a_build_script_stamping_its_sources_into_out_dir_still_adapts() {
+    assert_a_stamping_build_script_adapts(
+        "let out = std::path::PathBuf::from(std::env::var(\"OUT_DIR\").unwrap());\n\
+         std::fs::write(out.join(\"stamp.txt\"), format!(\"{:x}\", hash.finish())).unwrap();",
+        "include_str!(concat!(env!(\"OUT_DIR\"), \"/stamp.txt\"))",
+    );
+}
+
+/// Build a fixture whose build script hashes `src/lib.rs` and publishes the
+/// digest with `publish`, and whose library reads it back with `read`, then
+/// edit it four times: a miss, a seed, then active runs.
+fn assert_a_stamping_build_script_adapts(publish: &str, read: &str) {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
+    let target = project.path().join("target");
+    create_fixture(project.path());
+    fs::write(
+        project.path().join("build.rs"),
+        format!(
+            "use std::hash::{{Hash, Hasher}};\n\
+             fn main() {{\n\
+                 let mut hash = std::collections::hash_map::DefaultHasher::new();\n\
+                 std::fs::read(\"src/lib.rs\").unwrap().hash(&mut hash);\n\
+                 println!(\"cargo:rerun-if-changed=src\");\n\
+                 {publish}\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+
+    let first_mtime = past_mtime();
+    let build = |edit: i64| {
+        let source = format!(
+            "pub const STAMP: &str = {read};\n\
+             pub fn answer() -> u64 {{ {edit} }}\n"
+        );
+        build_files(
+            project.path(),
+            cache.path(),
+            &target,
+            first_mtime + edit,
+            &[("src/lib.rs", Some(&source))],
+        )
+    };
+
+    let first = build(0);
+    assert_eq!(first["result"], "miss", "event: {first:#}");
+    let seed = build(1);
+    assert_passthrough(&seed, "adaptive seed");
+    assert_eq!(seed["compiler_runs"], 1, "event: {seed:#}");
+    for edit in 2..=4 {
+        let active = build(edit);
+        assert_passthrough(&active, "adaptive active");
+        assert_eq!(active["key_ms"], 0, "event: {active:#}");
+    }
+}
+
+/// Switching back to a commit that adds a module restores the unit from the
+/// cache, although the private compile in between never read that module.
+#[test]
+fn a_return_to_cached_sources_that_add_a_module_restores_them() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
+    let target = project.path().join("target");
+    create_fixture(project.path());
+
+    let first_mtime = past_mtime();
+    let mut tick = 0;
+    let mut check_out = |files: &[(&str, Option<&str>)]| {
+        tick += 1;
+        build_files(
+            project.path(),
+            cache.path(),
+            &target,
+            first_mtime + tick,
+            files,
+        )
+    };
+    let with_module = [
+        (
+            "src/lib.rs",
+            Some("mod added;\npub fn answer() -> u64 { added::ANSWER }\n"),
+        ),
+        ("src/added.rs", Some("pub const ANSWER: u64 = 2;\n")),
+    ];
+    let without_module = [
+        ("src/lib.rs", Some("pub fn answer() -> u64 { 1 }\n")),
+        ("src/added.rs", None),
+    ];
+
+    let stored = check_out(&with_module);
+    assert_eq!(stored["result"], "miss", "event: {stored:#}");
+    let switched = check_out(&without_module);
+    assert_passthrough(&switched, "adaptive seed");
+    let returned = check_out(&with_module);
+    assert_eq!(returned["result"], "local_hit", "event: {returned:#}");
+    assert_eq!(returned["compiler_runs"], 0, "event: {returned:#}");
+}
+
 #[test]
 fn user_facing_executable_without_fallback_uses_default_immediate_adaptive_lane() {
     let project = tempfile::tempdir().unwrap();
