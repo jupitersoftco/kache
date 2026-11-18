@@ -227,6 +227,13 @@ pub struct Config {
     /// artifact caching. Enabled by default; `preserve_incremental` remains the
     /// explicit force mode.
     pub adaptive_incremental: bool,
+    /// The Cargo profile directory names adaptive incremental may manage,
+    /// such as `iteration`. `None` (the default) means every profile. A unit
+    /// in any other profile takes the normal cache path. A force-listed crate
+    /// ([`Config::incremental_crates`]) is not limited by this list.
+    /// `[cache] adaptive_incremental_profiles` or the comma-separated
+    /// `KACHE_ADAPTIVE_INCREMENTAL_PROFILES`.
+    pub adaptive_incremental_profiles: Option<Vec<String>>,
     /// Seed private incremental state from compatible local Cargo targets.
     /// Enabled by default; `KACHE_SEED_INCREMENTAL=0` opts out.
     pub seed_incremental: bool,
@@ -815,6 +822,16 @@ impl Config {
     pub fn incremental_crate_forced(&self, crate_name: &str) -> bool {
         incremental_crate_forced_in(&self.incremental_crates, crate_name)
     }
+
+    /// Whether adaptive incremental may manage a unit in the Cargo profile
+    /// directory named `profile` (`iteration` for `target/iteration` and
+    /// `target/<triple>/iteration`). See
+    /// [`Config::adaptive_incremental_profiles`].
+    pub fn adaptive_incremental_profile_in_scope(&self, profile: &std::ffi::OsStr) -> bool {
+        self.adaptive_incremental_profiles
+            .as_ref()
+            .is_none_or(|profiles| profiles.iter().any(|name| profile == name.as_str()))
+    }
 }
 
 impl RemoteConfig {
@@ -1081,6 +1098,8 @@ pub struct CacheFileConfig {
     pub clean_incremental: Option<bool>,
     pub preserve_incremental: Option<bool>,
     pub adaptive_incremental: Option<bool>,
+    /// See [`Config::adaptive_incremental_profiles`].
+    pub adaptive_incremental_profiles: Option<Vec<String>>,
     pub seed_incremental: Option<bool>,
     pub incremental_seed_from: Option<String>,
     pub unstable: Option<bool>,
@@ -1219,7 +1238,9 @@ impl EnvOverrides {
             cache_executables: env_or_ignored("KACHE_CACHE_EXECUTABLES", ignore_env).is_ok(),
             clean_incremental: env_or_ignored("KACHE_CLEAN_INCREMENTAL", ignore_env).is_ok(),
             preserve_incremental: env_or_ignored("KACHE_PRESERVE_INCREMENTAL", ignore_env).is_ok(),
-            adaptive_incremental: env_or_ignored("KACHE_ADAPTIVE_INCREMENTAL", ignore_env).is_ok(),
+            adaptive_incremental: std::env::var_os("KACHE_ADAPTIVE_INCREMENTAL").is_some_and(
+                |value| env_override_applies("KACHE_ADAPTIVE_INCREMENTAL", &value, ignore_env),
+            ),
             s3_bucket: env_or_ignored("KACHE_S3_BUCKET", ignore_env).is_ok(),
             s3_endpoint: env_or_ignored("KACHE_S3_ENDPOINT", ignore_env).is_ok(),
             s3_region: env_or_ignored("KACHE_S3_REGION", ignore_env).is_ok(),
@@ -1458,6 +1479,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_CLEAN_INCREMENTAL",
     "KACHE_PRESERVE_INCREMENTAL",
     "KACHE_ADAPTIVE_INCREMENTAL",
+    "KACHE_ADAPTIVE_INCREMENTAL_PROFILES",
     "KACHE_SEED_INCREMENTAL",
     "KACHE_INCREMENTAL_SEED_FROM",
     "KACHE_UNSTABLE",
@@ -1554,6 +1576,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_CLEAN_INCREMENTAL", "cache.clean_incremental"),
     ("KACHE_PRESERVE_INCREMENTAL", "cache.preserve_incremental"),
     ("KACHE_ADAPTIVE_INCREMENTAL", "cache.adaptive_incremental"),
+    (
+        "KACHE_ADAPTIVE_INCREMENTAL_PROFILES",
+        "cache.adaptive_incremental_profiles",
+    ),
     ("KACHE_SEED_INCREMENTAL", "cache.seed_incremental"),
     ("KACHE_INCREMENTAL_SEED_FROM", "cache.incremental_seed_from"),
     ("KACHE_UNSTABLE", "cache.unstable"),
@@ -1722,6 +1748,46 @@ fn env_or_ignored_for(
     }
 }
 
+/// Whether the set variable `name`, with `value`, overrides the file.
+///
+/// `ignore_env` stops every gated variable but one value: turning adaptive
+/// incremental off. That only sends units down the keyed cache path, so it
+/// can neither shift a cache key nor enable anything, and a build that locks
+/// adaptive off for one process (a push gate, a run meant to store) must get
+/// the keyed path whatever the file says.
+fn env_override_applies(name: &str, value: &std::ffi::OsStr, ignore_env: bool) -> bool {
+    !ignore_env
+        || (name == "KACHE_ADAPTIVE_INCREMENTAL" && value.to_str().is_some_and(env_flag_off))
+}
+
+/// The permissive off spelling: `0` or case-insensitive `false`.
+fn env_flag_off(value: &str) -> bool {
+    value == "0" || value.eq_ignore_ascii_case("false")
+}
+
+/// Adaptive incremental from this invocation's variable, else the file, else
+/// on. Any value other than `0` or `false` turns it on; see
+/// [`env_override_applies`] for what `ignore_env` leaves in effect.
+fn adaptive_incremental_setting(env: Option<&str>, ignore_env: bool, file: Option<bool>) -> bool {
+    match env.filter(|value| {
+        env_override_applies("KACHE_ADAPTIVE_INCREMENTAL", value.as_ref(), ignore_env)
+    }) {
+        Some(value) => !env_flag_off(value),
+        None => file.unwrap_or(true),
+    }
+}
+
+/// Profile names from the file list or the comma-separated variable:
+/// trimmed, with empty entries dropped.
+fn adaptive_profile_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    names
+        .into_iter()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The OUT_DIR alias setting from an env value, else the file, else on. Only
 /// `0` and `false` turn it off.
 fn out_dir_alias_setting(env: Option<&str>, file: Option<bool>) -> bool {
@@ -1746,7 +1812,11 @@ fn warn_ignored_env_overrides_for(invocation: &InvocationEnv) {
     let present: Vec<&str> = IGNORE_ENV_GATED_VARS
         .iter()
         .copied()
-        .filter(|name| invocation.var_os(name).is_some())
+        .filter(|name| {
+            invocation
+                .var_os(name)
+                .is_some_and(|value| !env_override_applies(name, &value, true))
+        })
         .collect();
     if !present.is_empty() {
         tracing::warn!(
@@ -1957,17 +2027,33 @@ impl Config {
                         .unwrap_or(false)
                 });
 
-        let adaptive_incremental =
-            env_or_ignored_for(invocation, "KACHE_ADAPTIVE_INCREMENTAL", ignore_env)
-                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                .unwrap_or_else(|_| {
-                    file_config
-                        .as_ref()
-                        .ok()
-                        .and_then(|c| c.cache.as_ref())
-                        .and_then(|c| c.adaptive_incremental)
-                        .unwrap_or(true)
-                });
+        let adaptive_incremental = adaptive_incremental_setting(
+            invocation.var("KACHE_ADAPTIVE_INCREMENTAL").ok().as_deref(),
+            ignore_env,
+            file_config
+                .as_ref()
+                .ok()
+                .and_then(|c| c.cache.as_ref())
+                .and_then(|c| c.adaptive_incremental),
+        );
+
+        let adaptive_incremental_profiles = env_or_ignored_for(
+            invocation,
+            "KACHE_ADAPTIVE_INCREMENTAL_PROFILES",
+            ignore_env,
+        )
+        .map(|v| adaptive_profile_names(v.split(',')))
+        .ok()
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .ok()?
+                .cache
+                .as_ref()?
+                .adaptive_incremental_profiles
+                .as_ref()
+                .map(|names| adaptive_profile_names(names.iter().map(String::as_str)))
+        });
 
         let seed_incremental = env_or_ignored_for(invocation, "KACHE_SEED_INCREMENTAL", ignore_env)
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
@@ -2684,6 +2770,7 @@ impl Config {
             clean_incremental,
             preserve_incremental,
             adaptive_incremental,
+            adaptive_incremental_profiles,
             seed_incremental,
             unstable,
             incremental_seed_from: env_or_ignored_for(
@@ -4883,9 +4970,6 @@ fn collect_host_keys(
 /// [`ENV_FILE_KEYS`]. A table replaced whole, such as `cache.remote`, is
 /// overridden by the variable of any key inside it.
 fn env_override_for(path: &[String], ignore_env: bool) -> Option<&'static str> {
-    if ignore_env {
-        return None;
-    }
     let key = path.join(".");
     let inside = format!("{key}.");
     let whole_table = is_host_atomic_table(path);
@@ -4893,7 +4977,8 @@ fn env_override_for(path: &[String], ignore_env: bool) -> Option<&'static str> {
         .iter()
         .find(|(var, file_key)| {
             (*file_key == key || (whole_table && file_key.starts_with(&inside)))
-                && std::env::var_os(var).is_some()
+                && std::env::var_os(var)
+                    .is_some_and(|value| env_override_applies(var, &value, ignore_env))
         })
         .map(|(var, _)| *var)
 }

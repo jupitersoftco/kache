@@ -3974,6 +3974,7 @@ fn save_manifest_config(
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,
+        adaptive_incremental_profiles: None,
         seed_incremental: true,
         incremental_seed_from: None,
         unstable: Default::default(),
@@ -11915,4 +11916,30 @@ fn compact_stats_label_scheduler_evidence_as_recorded_history() {
     assert!(legacy.longest_scheduler_wait.is_none());
     assert_eq!(legacy.total_flight_wait_ms, 0);
     assert_eq!(legacy.total_permit_wait_ms, 0);
+}
+
+#[test]
+fn doctor_shows_the_adaptive_switch_and_its_profile_scope() {
+    let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+    assert_eq!(adaptive_incremental_detail(true, None), "on, every profile");
+    assert_eq!(
+        adaptive_incremental_detail(true, Some(&names(&["iteration"]))),
+        "on, profiles iteration"
+    );
+    assert_eq!(
+        adaptive_incremental_detail(true, Some(&names(&["iteration", "debug"]))),
+        "on, profiles iteration, debug"
+    );
+    assert_eq!(
+        adaptive_incremental_detail(true, Some(&[])),
+        "on, no profile"
+    );
+    assert_eq!(
+        adaptive_incremental_detail(false, Some(&names(&["iteration"]))),
+        "off (when on: profiles iteration)"
+    );
+    assert_eq!(
+        adaptive_incremental_detail(false, None),
+        "off (when on: every profile)"
+    );
 }

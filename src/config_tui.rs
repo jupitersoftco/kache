@@ -2287,6 +2287,7 @@ mod tests {
                 clean_incremental: Some(false),
                 preserve_incremental: Some(true),
                 adaptive_incremental: Some(false),
+                adaptive_incremental_profiles: None,
                 seed_incremental: None,
                 incremental_seed_from: None,
                 unstable: Default::default(),
