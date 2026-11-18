@@ -3179,7 +3179,7 @@ mod tests {
                 Some(externs("edit-2"))
             })
             .expect("a dependency still moved keeps the fast path");
-        assert_eq!(budget.get(), Some(MAX_EXTERN_BYTES));
+        assert_eq!(budget.get(), Some(512 * 1024 * 1024), "512 MiB");
         assert!(lease.finish_at(CompileOutcome::Success, 104));
         assert_eq!(read_state(&unit).last_externs, Some(externs("edit-2")));
 
