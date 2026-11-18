@@ -532,6 +532,16 @@ impl AdaptiveUnit {
         }
     }
 
+    /// [`Self::cached_source_set_digest`] after a private compile, or none
+    /// when it read beyond the cached files, as [`Self::try_active_at`]
+    /// records it.
+    fn private_sources_digest(&self) -> Option<String> {
+        if self.reads_beyond_cached_sources() {
+            return None;
+        }
+        self.cached_source_set_digest()
+    }
+
     fn cached_dep_info(&self) -> PathBuf {
         self.unit_dir.join(CACHED_DEP_INFO)
     }
@@ -659,17 +669,18 @@ impl AdaptiveUnit {
             .cached_sources
             .as_ref()
             .and_then(|_| self.cached_source_set_digest());
-        if current.is_some()
-            && current == state.cached_sources
-            && current != state.last_sources
-            && !self.reads_beyond_cached_sources()
-        {
+        let at_cached = current.is_some() && current == state.cached_sources;
+        let beyond = at_cached && self.reads_beyond_cached_sources();
+        if at_cached && current != state.last_sources && !beyond {
             return None;
         }
 
         let mut busy = state;
         if current.is_some() {
-            busy.last_sources = current;
+            // Sources beyond the cached files are not the cached ones. Their
+            // digest over the cached files alone would skip the lookup once
+            // the extra files are gone.
+            busy.last_sources = current.filter(|_| !beyond);
         }
         busy.active_leases += 1;
         busy.in_flight = true;
@@ -1170,7 +1181,7 @@ impl Lease {
                 last_sources: previous
                     .cached_sources
                     .as_ref()
-                    .and_then(|_| self.unit.cached_source_set_digest()),
+                    .and_then(|_| self.unit.private_sources_digest()),
                 cached_sources: previous.cached_sources,
             }),
             // A failed seed leaves the unit as it found it; the next miss seeds again.
@@ -3189,6 +3200,24 @@ mod tests {
             .try_active_at(105)
             .expect("the added file still exists");
         assert!(lease.finish_at(CompileOutcome::Success, 106));
+
+        // Once it is gone, the sources are the cached ones again.
+        check_out(&checkout, &[("src/data.txt", None)]);
+        assert!(unit.try_active_at(107).is_none());
+    }
+
+    /// The same for a seed whose compile read the extra file: removing it
+    /// returns to the cached sources.
+    #[test]
+    fn a_seed_that_read_beyond_the_cached_files_is_no_return_until_they_go() {
+        let (_temp, checkout, unit) = fixture_with_sources();
+        teach(&unit, 100);
+        check_out(&checkout, &[("src/data.txt", Some("added"))]);
+        seed_from(&unit, &["src/lib.rs", "src/a.rs", "src/data.txt"], 101);
+        assert_eq!(read_state(&unit).last_sources, None);
+
+        check_out(&checkout, &[("src/data.txt", None)]);
+        assert!(unit.try_active_at(103).is_none());
     }
 
     #[test]
