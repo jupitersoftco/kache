@@ -7066,7 +7066,7 @@ fn adaptive_incremental_env_opt_out_wins_over_every_file_shape() {
             load_invocation_config(root.path(), path, *host_path, &[]).adaptive_incremental,
             "{name}: the shape must turn adaptive on without the variable"
         );
-        for off in ["0", "false", "FALSE", "off", "no"] {
+        for off in ["0", "false", "FALSE"] {
             assert!(
                 !load_invocation_config(
                     root.path(),
@@ -7203,13 +7203,15 @@ fn only_the_adaptive_opt_out_survives_ignore_env() {
             "without ignore_env {name}={value} applies"
         );
     }
-    for off in ["0", "false", "False", "off", "OFF", "no", " 0 "] {
+    for off in ["0", "false", "False", "FALSE"] {
         assert!(
             env_override_applies(adaptive, OsStr::new(off), true),
             "{off}"
         );
     }
-    for on in ["1", "true", "", "  ", "yes", "00", "falsey"] {
+    for on in [
+        "1", "true", "", "  ", "yes", "00", "falsey", "off", "OFF", "no", " 0 ", "false ",
+    ] {
         assert!(
             !env_override_applies(adaptive, OsStr::new(on), true),
             "{on:?}"
@@ -7273,8 +7275,11 @@ fn only_the_adaptive_opt_out_survives_ignore_env() {
         (Some("1"), true, None, true),
         (Some("0"), true, Some(true), false),
         (Some("FALSE"), true, None, false),
-        (Some("off"), false, Some(true), false),
-        (Some("no"), true, Some(true), false),
+        // Only `0` and `false` are off; other spellings turn adaptive on,
+        // or are ignored under `ignore_env`.
+        (Some("off"), false, Some(false), true),
+        (Some("no"), true, Some(true), true),
+        (Some(" 0 "), true, Some(true), true),
         (Some(""), false, Some(false), false),
         (Some(" "), true, Some(false), false),
         (Some(""), false, None, true),

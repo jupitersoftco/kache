@@ -1772,12 +1772,12 @@ fn env_override_applies(name: &str, value: &std::ffi::OsStr, ignore_env: bool) -
     }
 }
 
-/// The off spellings of `KACHE_ADAPTIVE_INCREMENTAL`, trimmed and
-/// case-insensitive: `0`, `false`, `off` or `no`.
+/// The off spelling of `KACHE_ADAPTIVE_INCREMENTAL`: exactly `0` or
+/// case-insensitive `false`, as upstream reads it. Callers that lock adaptive
+/// off for one process (RedHope's push gate and its lane detection) mirror
+/// this exact rule, so widening it would desynchronise them.
 fn env_flag_off(value: &str) -> bool {
-    ["0", "false", "off", "no"]
-        .iter()
-        .any(|off| value.trim().eq_ignore_ascii_case(off))
+    value == "0" || value.eq_ignore_ascii_case("false")
 }
 
 /// Adaptive incremental from this invocation's variable, else the file, else

@@ -258,3 +258,43 @@ fn the_per_process_opt_out_stores_in_scope_units_whatever_the_file_says() {
         assert_adaptive(&fixture.build("iteration", 32, &[]), "adaptive seed");
     }
 }
+
+/// A storer run can land between two adaptive builds in the same target: a
+/// developer's `iteration` unit is adaptive-active, then a run locked with
+/// `KACHE_ADAPTIVE_INCREMENTAL=0` compiles new content there (a miss that
+/// stores), then the developer builds a third content unlocked. The locked
+/// run must key and store normally whatever state the unit holds, and the
+/// unlocked build after it must compile the current source.
+#[test]
+fn a_locked_storer_run_between_adaptive_builds_stores_and_adaptive_resumes() {
+    let mut fixture = Fixture::new(SCOPED);
+    let locked = [("KACHE_ADAPTIVE_INCREMENTAL", "0")];
+
+    assert_result(&fixture.build("iteration", 1, &[]), "miss");
+    assert_adaptive(&fixture.build("iteration", 2, &[]), "adaptive seed");
+    assert_adaptive(&fixture.build("iteration", 3, &[]), "adaptive active");
+
+    // The storer run: one keyed compile of the new content.
+    let stored = fixture.build("iteration", 4, &locked);
+    assert_result(&stored, "miss");
+    assert_eq!(stored["compiler_runs"], 1, "event: {stored:#}");
+
+    // The developer's next edit compiles its own source once, either back
+    // on the adaptive path or as a keyed miss that restarts learning.
+    let resumed = fixture.build("iteration", 5, &[]);
+    assert_eq!(resumed["compiler_runs"], 1, "event: {resumed:#}");
+    match resumed["result"].as_str() {
+        Some("miss") => {}
+        Some("passthrough") => assert!(
+            resumed["passthrough_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("adaptive")),
+            "event: {resumed:#}"
+        ),
+        _ => panic!("unexpected result after the storer run; event: {resumed:#}"),
+    }
+
+    // What the storer run stored is restorable, and adaptive builds left it
+    // intact: a locked return to its content hits.
+    assert_result(&fixture.build("iteration", 4, &locked), "local_hit");
+}
